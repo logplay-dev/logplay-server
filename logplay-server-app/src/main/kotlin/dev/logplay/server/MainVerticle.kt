@@ -1,10 +1,9 @@
-package dev.logplay.logplay_server
+package dev.logplay.server
 
 import io.vertx.core.Future
 import io.vertx.core.VerticleBase
 
 class MainVerticle : VerticleBase() {
-
     override fun start(): Future<*> {
         return vertx
             .createHttpServer()
