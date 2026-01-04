@@ -21,7 +21,7 @@ application {
 }
 
 dependencies {
-    implementation(project(":logplay-server-domain"))
+    implementation(project(":logplay-server-core"))
     implementation(platform("io.vertx:vertx-stack-depchain:$vertxVersion"))
     implementation("io.vertx:vertx-launcher-application")
     implementation("io.vertx:vertx-config")
