@@ -1,19 +1,20 @@
 package dev.logplay.server.job.use.case
 
-import dev.logplay.server.core.job.CompleteJobUseCase
-import dev.logplay.server.core.job.CreateJobUseCase
-import dev.logplay.server.core.job.GetPendingJobsUseCase
-import dev.logplay.server.core.job.JobGateway
-import dev.logplay.server.core.job.SaveJobCheckpointUseCase
-import dev.logplay.server.core.job.impl.CompleteJobUseCaseImpl
-import dev.logplay.server.core.job.impl.CreateJobUseCaseImpl
-import dev.logplay.server.core.job.impl.GetPendingJobsUseCaseImpl
-import dev.logplay.server.core.job.impl.SaveJobCheckpointUseCaseImpl
+import dev.logplay.server.core.job.*
+import dev.logplay.server.core.job.impl.*
+import dev.logplay.server.core.worker.WorkerGateway
 
-class JobUseCaseLookUp(jobGateway: JobGateway) {
+class JobUseCaseLookUp(jobGateway: JobGateway, workerGateway: WorkerGateway) {
     val createJobUseCase: CreateJobUseCase = CreateJobUseCaseImpl(jobGateway)
-    val getPendingJobsUseCase: GetPendingJobsUseCase = GetPendingJobsUseCaseImpl(jobGateway)
+    val acquirePendingJobsUseCase: AcquirePendingJobsUseCase =
+        AcquirePendingJobsUseCaseImpl(jobGateway, workerGateway)
     val saveJobCheckpointUseCase: SaveJobCheckpointUseCase =
         SaveJobCheckpointUseCaseImpl(jobGateway)
+    val getCheckpointsUseCase: GetCheckpointsUseCase = GetCheckpointsUseCaseImpl(jobGateway)
     val completeJobUseCase: CompleteJobUseCase = CompleteJobUseCaseImpl(jobGateway)
+    val releaseJobUseCase: ReleaseJobUseCase = ReleaseJobUseCaseImpl(jobGateway)
+    val reportExecutionErrorUseCase: ReportExecutionErrorUseCase =
+        ReportExecutionErrorUseCaseImpl(jobGateway)
+    val abortJobUseCase: AbortJobUseCase = AbortJobUseCaseImpl(jobGateway)
+    val getJobEventsUseCase: GetJobEventsUseCase = GetJobEventsUseCaseImpl(jobGateway)
 }

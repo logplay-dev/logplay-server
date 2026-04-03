@@ -4,8 +4,8 @@ interface CreateJobUseCase {
     suspend fun execute(createJobCommand: CreateJobCommand): Job
 }
 
-interface GetPendingJobsUseCase {
-    suspend fun execute(getPendingJobsCommand: GetPendingJobsCommand): List<Job>
+interface AcquirePendingJobsUseCase {
+    suspend fun execute(command: AcquirePendingJobsCommand): List<Job>
 }
 
 interface SaveJobCheckpointUseCase {
@@ -14,4 +14,24 @@ interface SaveJobCheckpointUseCase {
 
 interface CompleteJobUseCase {
     suspend fun execute(command: CompleteJobCommand): Job
+}
+
+interface ReleaseJobUseCase {
+    suspend fun execute(command: ReleaseJobCommand): Job
+}
+
+interface GetCheckpointsUseCase {
+    suspend fun execute(command: GetCheckpointsCommand): CheckpointPage
+}
+
+interface ReportExecutionErrorUseCase {
+    suspend fun execute(command: ReportExecutionErrorCommand): Job
+}
+
+interface AbortJobUseCase {
+    suspend fun execute(command: AbortJobCommand): Job
+}
+
+interface GetJobEventsUseCase {
+    suspend fun execute(jobId: String): List<JobEvent>
 }

@@ -2,27 +2,35 @@ import org.gradle.api.tasks.testing.logging.TestLogEvent.*
 
 plugins {
     id("kotlin-module-base")
+    `java-test-fixtures`
 }
 
 repositories {
     mavenCentral()
 }
 
-val vertxVersion = "5.0.6"
-val junitJupiterVersion = "5.9.1"
-
 dependencies {
     api(project(":logplay-server-domain"))
-    api(platform("io.vertx:vertx-stack-depchain:$vertxVersion"))
-    api("io.vertx:vertx-lang-kotlin-coroutines")
-    api("io.vertx:vertx-lang-kotlin")
-    implementation("io.vertx:vertx-config")
-    implementation("io.vertx:vertx-web")
-    implementation("io.vertx:vertx-opentelemetry")
-    implementation("io.vertx:vertx-grpc-server")
-    testImplementation("io.vertx:vertx-junit5")
-    testImplementation("org.junit.jupiter:junit-jupiter:$junitJupiterVersion")
-    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    api(platform(libs.vertx.bom))
+    api(libs.vertx.lang.kotlin.coroutines)
+    api(libs.vertx.lang.kotlin)
+    implementation(libs.vertx.config)
+    implementation(libs.vertx.web)
+    implementation(libs.jackson.module.kotlin)
+    implementation(libs.vertx.opentelemetry)
+    implementation(libs.vertx.grpc.server)
+    implementation(libs.log4j.slf4j2.impl)
+    testImplementation(libs.vertx.junit5)
+    testImplementation(libs.junit.jupiter)
+    testRuntimeOnly(libs.junit.platform.launcher)
+
+    testFixturesImplementation(platform(libs.vertx.bom))
+    testFixturesImplementation(libs.vertx.web.client)
+    testFixturesImplementation(libs.vertx.junit5)
+    testFixturesImplementation(libs.junit.jupiter)
+    testFixturesRuntimeOnly(libs.junit.platform.launcher)
+    testFixturesImplementation(libs.assertj.core)
+    testFixturesImplementation(libs.kotlinx.coroutines.test)
 }
 
 tasks.withType<Test> {

@@ -1,9 +1,10 @@
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+import org.gradle.api.tasks.testing.logging.TestLogEvent.*
 
 plugins {
     id("kotlin-module-base")
     application
-    id("com.gradleup.shadow") version "9.2.2"
+    alias(libs.plugins.shadow)
 }
 
 repositories {
@@ -16,10 +17,48 @@ application {
 
 dependencies {
     implementation(project(":logplay-server-app"))
-    implementation("com.h2database:h2:2.3.232")
+    implementation(libs.h2.database)
+    implementation(libs.flyway.core)
+    implementation(libs.log4j.slf4j2.impl)
+
+    testImplementation(testFixtures(project(":logplay-server-app")))
+    testImplementation(platform(libs.vertx.bom))
+    testImplementation(libs.vertx.web.client)
+    testImplementation(libs.vertx.junit5)
+    testImplementation(libs.junit.jupiter)
+    testRuntimeOnly(libs.junit.platform.launcher)
+    testImplementation(libs.assertj.core)
+    testImplementation(libs.kotlinx.coroutines.test)
 }
 
 tasks.withType<ShadowJar> {
     archiveClassifier.set("fat")
     mergeServiceFiles()
+}
+
+tasks.withType<Test> {
+    useJUnitPlatform()
+    testLogging {
+        events = setOf(PASSED, SKIPPED, FAILED)
+    }
+}
+
+tasks.test {
+    useJUnitPlatform {
+        excludeTags("integration")
+    }
+}
+
+tasks.register<Test>("integrationTest") {
+    description = "Runs integration tests."
+    group = "verification"
+    testClassesDirs = sourceSets.test.get().output.classesDirs
+    classpath = sourceSets.test.get().runtimeClasspath
+    useJUnitPlatform {
+        includeTags("integration")
+    }
+    testLogging {
+        events = setOf(PASSED, SKIPPED, FAILED)
+    }
+    shouldRunAfter(tasks.test)
 }
