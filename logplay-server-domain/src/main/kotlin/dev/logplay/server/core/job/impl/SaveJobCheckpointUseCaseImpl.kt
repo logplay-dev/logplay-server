@@ -3,7 +3,6 @@ package dev.logplay.server.core.job.impl
 import dev.logplay.server.core.job.*
 import dev.logplay.server.core.worker.BlankWorkerIdException
 import java.time.Instant
-import java.util.UUID
 
 class SaveJobCheckpointUseCaseImpl(private val jobGateway: JobGateway) : SaveJobCheckpointUseCase {
 
@@ -19,7 +18,11 @@ class SaveJobCheckpointUseCaseImpl(private val jobGateway: JobGateway) : SaveJob
                 if (lastCheckpoint?.id != command.previousCheckpointId)
                     throw InvalidCheckpointOrderException(command.jobId)
                 Checkpoint(
-                    id = UUID.randomUUID().toString(),
+                    id =
+                        CheckpointIdGenerator.fromChainPosition(
+                            command.jobId,
+                            command.previousCheckpointId,
+                        ),
                     jobId = command.jobId,
                     previousCheckpointId = command.previousCheckpointId,
                     name = command.name,

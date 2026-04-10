@@ -196,6 +196,7 @@ class CleanupDeadWorkersUseCaseTest {
     private fun aJob(acquiredByWorkerId: String) =
         Job(
             id = UUID.randomUUID().toString(),
+            groupId = "test-group",
             name = "test-job",
             type = "test-type",
             status = JobStatus.ACQUIRED,

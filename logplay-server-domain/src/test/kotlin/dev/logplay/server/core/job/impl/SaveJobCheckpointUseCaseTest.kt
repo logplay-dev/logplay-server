@@ -4,7 +4,7 @@ import dev.logplay.server.core.job.*
 import dev.logplay.server.core.job.fakes.InMemoryJobGateway
 import dev.logplay.server.core.worker.BlankWorkerIdException
 import java.time.Instant
-import java.util.UUID
+import java.util.*
 import kotlinx.coroutines.test.runTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
@@ -61,7 +61,7 @@ class SaveJobCheckpointUseCaseTest {
     }
 
     @Test
-    fun `execute should generate a unique id for each checkpoint`() = runTest {
+    fun `execute should generate deterministic ids from chain position`() = runTest {
         val job = aJob(status = JobStatus.ACQUIRED, acquiredByWorkerId = workerId)
         gateway.save(job)
 
@@ -74,7 +74,8 @@ class SaveJobCheckpointUseCaseTest {
                 SaveJobCheckpointCommand(job.id, workerId, first.id, "step-two", byteArrayOf())
             )
 
-        assertThat(first.id).isNotBlank()
+        assertThat(first.id).isEqualTo(CheckpointIdGenerator.fromChainPosition(job.id, null))
+        assertThat(second.id).isEqualTo(CheckpointIdGenerator.fromChainPosition(job.id, first.id))
         assertThat(first.id).isNotEqualTo(second.id)
         assertThat(second.previousCheckpointId).isEqualTo(first.id)
         assertThat(first.orderKey).isEqualTo(1)
@@ -345,6 +346,7 @@ class SaveJobCheckpointUseCaseTest {
     private fun aJob(status: JobStatus, acquiredByWorkerId: String? = null) =
         Job(
             id = UUID.randomUUID().toString(),
+            groupId = "test-group",
             name = "test-job",
             type = "test-type",
             status = status,

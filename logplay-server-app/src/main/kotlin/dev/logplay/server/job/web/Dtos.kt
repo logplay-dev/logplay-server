@@ -3,9 +3,9 @@ package dev.logplay.server.job.web
 import dev.logplay.server.core.job.*
 import dev.logplay.server.core.worker.BlankWorkerIdException
 import java.util.Base64
-import java.util.UUID
 
 data class CreateJobRequest(
+    val groupId: String? = null,
     val name: String? = null,
     val type: String? = null,
     val maxRetries: Int? = null,
@@ -13,7 +13,12 @@ data class CreateJobRequest(
     val inputData: String? = null,
 )
 
-data class AcquireJobsRequest(val workerId: String? = null, val limit: Int? = null)
+data class AcquireJobsRequest(
+    val groupId: String? = null,
+    val type: String? = null,
+    val workerId: String? = null,
+    val limit: Int? = null,
+)
 
 data class CompleteJobRequest(val workerId: String? = null, val outputData: String? = null)
 
@@ -30,6 +35,7 @@ data class SaveCheckpointRequest(
 
 data class JobResponse(
     val id: String,
+    val groupId: String,
     val name: String,
     val type: String,
     val status: String,
@@ -59,10 +65,11 @@ data class CheckpointPageResponse(val checkpoints: List<CheckpointResponse>, val
 fun CreateJobRequest.toCommand() =
     try {
         CreateJobCommand(
+            groupId = groupId ?: throw BlankGroupIdException(),
             name = name ?: "",
             type = type ?: throw BlankJobTypeException(),
             maxRetries = maxRetries,
-            idempotencyKey = idempotencyKey ?: UUID.randomUUID().toString(),
+            idempotencyKey = idempotencyKey ?: throw BlankIdempotencyKeyException(),
             inputData = inputData?.let { Base64.getDecoder().decode(it) },
         )
     } catch (_: IllegalArgumentException) {
@@ -71,6 +78,8 @@ fun CreateJobRequest.toCommand() =
 
 fun AcquireJobsRequest.toCommand() =
     AcquirePendingJobsCommand(
+        groupId = groupId ?: throw BlankGroupIdException(),
+        type = type ?: throw BlankJobTypeException(),
         workerId = workerId ?: throw BlankWorkerIdException(),
         limit = limit ?: 10,
     )
@@ -112,6 +121,7 @@ fun SaveCheckpointRequest.toCommand(jobId: String) =
 fun Job.toResponse() =
     JobResponse(
         id = id,
+        groupId = groupId,
         name = name,
         type = type,
         status = status.name,

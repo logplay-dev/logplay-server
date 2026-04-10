@@ -6,6 +6,8 @@ interface JobGateway {
     suspend fun insertJob(job: Job): Job
 
     suspend fun acquirePendingJobs(
+        groupId: String,
+        type: String,
         workerId: String,
         limit: Int,
         eventFactory: ((Job) -> JobEvent)? = null,
@@ -13,7 +15,7 @@ interface JobGateway {
 
     suspend fun findJobById(id: String): Job?
 
-    suspend fun findJobByIdempotencyKey(idempotencyKey: String): Job?
+    suspend fun findJobByIdempotencyKey(groupId: String, idempotencyKey: String): Job?
 
     suspend fun saveCheckpoint(
         jobId: String,

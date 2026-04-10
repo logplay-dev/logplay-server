@@ -11,14 +11,15 @@ class InMemoryJobGateway(private val workerGateway: InMemoryWorkerGateway? = nul
     private val events = mutableListOf<JobEvent>()
 
     override suspend fun insertJob(job: Job): Job {
-        if (jobs.containsKey(job.id)) throw JobAlreadyExistsException()
-        if (jobs.values.any { it.idempotencyKey == job.idempotencyKey })
-            throw DuplicateIdempotencyKeyException(job.idempotencyKey)
+        if (jobs.containsKey(job.id))
+            throw DuplicateIdempotencyKeyException(job.groupId, job.idempotencyKey)
         jobs[job.id] = job
         return job
     }
 
     override suspend fun acquirePendingJobs(
+        groupId: String,
+        type: String,
         workerId: String,
         limit: Int,
         eventFactory: ((Job) -> JobEvent)?,
@@ -29,7 +30,9 @@ class InMemoryJobGateway(private val workerGateway: InMemoryWorkerGateway? = nul
         }
         val pending =
             jobs.values
-                .filter { it.status == JobStatus.PENDING }
+                .filter {
+                    it.groupId == groupId && it.type == type && it.status == JobStatus.PENDING
+                }
                 .sortedBy { it.updatedAt }
                 .take(limit)
         val now = Instant.now()
@@ -56,8 +59,8 @@ class InMemoryJobGateway(private val workerGateway: InMemoryWorkerGateway? = nul
 
     override suspend fun findJobById(id: String): Job? = jobs[id]
 
-    override suspend fun findJobByIdempotencyKey(idempotencyKey: String): Job? =
-        jobs.values.find { it.idempotencyKey == idempotencyKey }
+    override suspend fun findJobByIdempotencyKey(groupId: String, idempotencyKey: String): Job? =
+        jobs.values.find { it.groupId == groupId && it.idempotencyKey == idempotencyKey }
 
     private fun validateCheckpointConstraints(checkpoint: Checkpoint) {
         val hasDuplicateOrder =

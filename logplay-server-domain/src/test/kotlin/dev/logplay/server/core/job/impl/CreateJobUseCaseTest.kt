@@ -65,6 +65,27 @@ class CreateJobUseCaseTest {
     }
 
     @Test
+    fun `execute should allow same idempotency key in different groups`() = runTest {
+        val job1 = useCase.execute(aCommand(groupId = "A", idempotencyKey = "K"))
+        val job2 = useCase.execute(aCommand(groupId = "B", idempotencyKey = "K"))
+
+        assertThat(job2.idempotencyKey).isEqualTo("K")
+        assertThat(job2.groupId).isEqualTo("B")
+        // Derived ids must differ when groupId differs even for the same key.
+        assertThat(job1.id).isNotEqualTo(job2.id)
+    }
+
+    @Test
+    fun `execute should derive job id deterministically from groupId and idempotencyKey`() =
+        runTest {
+            val expected = JobIdGenerator.fromIdempotencyKey("grp", "det-key")
+
+            val job = useCase.execute(aCommand(groupId = "grp", idempotencyKey = "det-key"))
+
+            assertThat(job.id).isEqualTo(expected)
+        }
+
+    @Test
     fun `execute should throw BlankIdempotencyKeyException when key is blank`() = runTest {
         val exception =
             runCatching { useCase.execute(aCommand(idempotencyKey = "  ")) }.exceptionOrNull()
@@ -89,6 +110,27 @@ class CreateJobUseCaseTest {
 
         assertThat(job.idempotencyKey).isEqualTo(exactKey)
     }
+
+    // --- Group ID validation ---
+
+    @Test
+    fun `execute should throw BlankGroupIdException when groupId is blank`() = runTest {
+        val exception1 = runCatching { useCase.execute(aCommand(groupId = "")) }.exceptionOrNull()
+        val exception2 = runCatching { useCase.execute(aCommand(groupId = "  ")) }.exceptionOrNull()
+
+        assertThat(exception1).isInstanceOf(BlankGroupIdException::class.java)
+        assertThat(exception2).isInstanceOf(BlankGroupIdException::class.java)
+    }
+
+    @Test
+    fun `execute should throw InvalidGroupIdException when groupId exceeds 64 characters`() =
+        runTest {
+            val exception =
+                runCatching { useCase.execute(aCommand(groupId = "a".repeat(65))) }
+                    .exceptionOrNull()
+
+            assertThat(exception).isInstanceOf(InvalidGroupIdException::class.java)
+        }
 
     // --- Validation ---
 
@@ -143,12 +185,14 @@ class CreateJobUseCaseTest {
     // --- Helpers ---
 
     private fun aCommand(
+        groupId: String = "test-group",
         name: String = "job",
         type: String = "render",
         maxRetries: Int? = null,
         idempotencyKey: String = UUID.randomUUID().toString(),
     ) =
         CreateJobCommand(
+            groupId = groupId,
             name = name,
             type = type,
             maxRetries = maxRetries,

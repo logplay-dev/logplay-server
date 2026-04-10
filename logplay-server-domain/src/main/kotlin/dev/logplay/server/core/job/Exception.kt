@@ -3,6 +3,10 @@ package dev.logplay.server.core.job
 abstract class JobException(message: String, cause: Throwable? = null) :
     RuntimeException(message, cause)
 
+class BlankGroupIdException : JobException("Group id cannot be blank")
+
+class InvalidGroupIdException(message: String) : JobException(message)
+
 class BlankJobTypeException : JobException("Job type cannot be blank")
 
 class InvalidJobTypeException(message: String) : JobException(message)
@@ -13,11 +17,8 @@ class BlankJobIdException : JobException("Job id cannot be blank")
 
 class InvalidCheckpointNameException(message: String) : JobException(message)
 
-class JobAlreadyExistsException(cause: Throwable? = null) :
-    JobException("Job already exists", cause)
-
-class DuplicateIdempotencyKeyException(idempotencyKey: String) :
-    JobException("Job with idempotency key '$idempotencyKey' already exists")
+class DuplicateIdempotencyKeyException(groupId: String, idempotencyKey: String) :
+    JobException("Job with idempotency key '$idempotencyKey' already exists in group '$groupId'")
 
 class BlankIdempotencyKeyException : JobException("Idempotency key cannot be blank")
 

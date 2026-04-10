@@ -239,6 +239,7 @@ class GetCheckpointsUseCaseTest {
     private fun aJob(status: JobStatus) =
         Job(
             id = UUID.randomUUID().toString(),
+            groupId = "test-group",
             name = "test-job",
             type = "test-type",
             status = status,

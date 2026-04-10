@@ -1,5 +1,6 @@
 CREATE TABLE jobs (
     id VARCHAR(64) PRIMARY KEY,
+    group_id VARCHAR(64) NOT NULL,
     name VARCHAR(256) NOT NULL,
     type VARCHAR(512) NOT NULL,
     status VARCHAR(64) NOT NULL,
@@ -40,14 +41,19 @@ CREATE TABLE workers (
 ALTER TABLE jobs ADD CONSTRAINT fk_job_acquired_worker FOREIGN KEY (acquired_by_worker_id) REFERENCES workers(id);
 
 -- Jobs indexes
-CREATE UNIQUE INDEX uq_job_idempotency_key ON jobs(idempotency_key);
-CREATE INDEX idx_jobs_status_updated_at ON jobs(status, updated_at);
+-- Idempotency uniqueness is enforced by the primary key: jobs.id is derived
+-- deterministically from (group_id, idempotency_key) via JobIdGenerator, so a
+-- duplicate insert collides on the PK and no separate unique index is needed.
+CREATE INDEX idx_jobs_status_updated_at ON jobs(group_id, type, status, updated_at);
 CREATE INDEX idx_jobs_acquired_worker ON jobs(acquired_by_worker_id, status);
 
 -- Checkpoints indexes
-CREATE INDEX idx_checkpoints_job_id ON checkpoints(job_id);
-CREATE UNIQUE INDEX uq_checkpoint_chain ON checkpoints(job_id, COALESCE(previous_checkpoint_id, 'ROOT'));
-CREATE UNIQUE INDEX uq_checkpoint_order ON checkpoints(job_id, order_key);
+-- Chain uniqueness is enforced by the primary key: checkpoints.id is derived
+-- deterministically from (job_id, previous_checkpoint_id) via CheckpointIdGenerator,
+-- so a duplicate chain position collides on the PK and no separate unique index is needed.
+-- Order uniqueness needs no index either: order_key is computed server-side inside a
+-- FOR UPDATE lock on the job row, making collisions unreachable.
+CREATE INDEX idx_checkpoints_job_order ON checkpoints(job_id, order_key);
 
 -- Job events table
 CREATE TABLE job_events (

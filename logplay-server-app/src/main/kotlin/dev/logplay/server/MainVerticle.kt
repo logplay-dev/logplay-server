@@ -76,6 +76,8 @@ class MainVerticle(private val jobGateway: JobGateway, private val workerGateway
         val (statusCode, message) =
             when (failure) {
                 // 400 — Bad Request
+                is BlankGroupIdException,
+                is InvalidGroupIdException,
                 is BlankJobTypeException,
                 is InvalidJobTypeException,
                 is InvalidJobNameException,
@@ -104,7 +106,6 @@ class MainVerticle(private val jobGateway: JobGateway, private val workerGateway
 
                 // 409 — Conflict
                 is DuplicateIdempotencyKeyException,
-                is JobAlreadyExistsException,
                 is JobNotAcquiredException,
                 is JobNotAbortableException,
                 is JobNotOwnedByWorkerException,

@@ -4,6 +4,7 @@ import java.time.Instant
 
 data class Job(
     val id: String,
+    val groupId: String,
     val name: String,
     val type: String,
     val status: JobStatus,
@@ -43,6 +44,7 @@ data class Checkpoint(
 }
 
 data class CreateJobCommand(
+    val groupId: String,
     val name: String,
     val type: String,
     val maxRetries: Int? = null,
@@ -50,7 +52,12 @@ data class CreateJobCommand(
     val inputData: ByteArray? = null,
 )
 
-data class AcquirePendingJobsCommand(val workerId: String, val limit: Int)
+data class AcquirePendingJobsCommand(
+    val groupId: String,
+    val type: String,
+    val workerId: String,
+    val limit: Int,
+)
 
 data class SaveJobCheckpointCommand(
     val jobId: String,

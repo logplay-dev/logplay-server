@@ -6,12 +6,16 @@ import java.util.*
 
 class CreateJobUseCaseImpl(private val jobGateway: JobGateway) : CreateJobUseCase {
     companion object {
+        const val MAX_GROUP_ID_LENGTH = 64
         const val MAX_NAME_LENGTH = 256
         const val MAX_TYPE_LENGTH = 512
         const val MAX_IDEMPOTENCY_KEY_LENGTH = 64
     }
 
     override suspend fun execute(createJobCommand: CreateJobCommand): Job {
+        if (createJobCommand.groupId.isBlank()) throw BlankGroupIdException()
+        if (createJobCommand.groupId.length > MAX_GROUP_ID_LENGTH)
+            throw InvalidGroupIdException("groupId must not exceed $MAX_GROUP_ID_LENGTH characters")
         if (createJobCommand.idempotencyKey.isBlank()) throw BlankIdempotencyKeyException()
         if (createJobCommand.idempotencyKey.length > MAX_IDEMPOTENCY_KEY_LENGTH)
             throw InvalidIdempotencyKeyException(
@@ -27,7 +31,12 @@ class CreateJobUseCaseImpl(private val jobGateway: JobGateway) : CreateJobUseCas
         val currentTime = Instant.now()
         val job =
             Job(
-                id = UUID.randomUUID().toString(),
+                id =
+                    JobIdGenerator.fromIdempotencyKey(
+                        createJobCommand.groupId,
+                        createJobCommand.idempotencyKey,
+                    ),
+                groupId = createJobCommand.groupId,
                 name = createJobCommand.name.ifBlank { UUID.randomUUID().toString() },
                 type = createJobCommand.type,
                 status = JobStatus.PENDING,

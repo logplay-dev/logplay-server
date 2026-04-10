@@ -18,11 +18,18 @@ class AcquirePendingJobsUseCaseImpl(
     }
 
     override suspend fun execute(command: AcquirePendingJobsCommand): List<Job> {
+        if (command.groupId.isBlank()) throw BlankGroupIdException()
+        if (command.type.isBlank()) throw BlankJobTypeException()
         if (command.workerId.isBlank()) throw BlankWorkerIdException()
         if (command.limit !in 1..MAX_LIMIT) throw InvalidLimitException(MAX_LIMIT)
         val now = Instant.now()
         val jobs =
-            jobGateway.acquirePendingJobs(command.workerId, command.limit) { job ->
+            jobGateway.acquirePendingJobs(
+                command.groupId,
+                command.type,
+                command.workerId,
+                command.limit,
+            ) { job ->
                 JobEvent(
                     id = UUID.randomUUID().toString(),
                     jobId = job.id,

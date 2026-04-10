@@ -12,16 +12,21 @@ import kotlinx.coroutines.withContext
 class H2JobGateway(private val dataSource: DataSource) : JobGateway {
 
     companion object {
-        private const val CONSTRAINT_JOBS_PK = "PRIMARY KEY ON PUBLIC.JOBS"
-        private const val CONSTRAINT_UQ_IDEMPOTENCY_KEY = "UQ_JOB_IDEMPOTENCY_KEY"
+        // jobs.id is derived deterministically from (groupId, idempotencyKey) by
+        // JobIdGenerator, so a PK collision always means a duplicate idempotency
+        // key was submitted. H2 auto-numbers the PK constraint (e.g. PRIMARY_KEY_2),
+        // so we match on the stable column reference "PUBLIC.JOBS(ID)" instead of
+        // the constraint name itself.
+        private const val CONSTRAINT_JOBS_PK = "PUBLIC.JOBS(ID)"
         private const val CONSTRAINT_FK_JOB_ACQUIRED_WORKER = "FK_JOB_ACQUIRED_WORKER"
+
+        // checkpoints.id is derived deterministically from (jobId, previousCheckpointId)
+        // by CheckpointIdGenerator, so a PK collision means a duplicate chain position
+        // was submitted. H2 auto-numbers the PK constraint, so we match on the stable
+        // column reference "PUBLIC.CHECKPOINTS(ID)" instead of the constraint name.
+        private const val CONSTRAINT_CHECKPOINTS_PK = "PUBLIC.CHECKPOINTS(ID)"
         private val CHECKPOINT_CONSTRAINTS =
-            setOf(
-                "UQ_CHECKPOINT_CHAIN",
-                "UQ_CHECKPOINT_ORDER",
-                "FK_CHECKPOINT_JOB",
-                "FK_CHECKPOINT_PREVIOUS",
-            )
+            setOf(CONSTRAINT_CHECKPOINTS_PK, "FK_CHECKPOINT_JOB", "FK_CHECKPOINT_PREVIOUS")
     }
 
     private fun SQLException.matchesConstraint(constraint: String): Boolean =
@@ -36,36 +41,38 @@ class H2JobGateway(private val dataSource: DataSource) : JobGateway {
                 dataSource.connection.use { conn ->
                     conn
                         .prepareStatement(
-                            "INSERT INTO jobs (id, name, type, status, retries, max_retries, idempotency_key, created_at, updated_at, last_acquired_at, acquired_by_worker_id, version, input_data, output_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                            "INSERT INTO jobs (id, group_id, name, type, status, retries, max_retries, idempotency_key, created_at, updated_at, last_acquired_at, acquired_by_worker_id, version, input_data, output_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                         )
                         .use { stmt ->
                             stmt.setString(1, job.id)
-                            stmt.setString(2, job.name)
-                            stmt.setString(3, job.type)
-                            stmt.setString(4, job.status.name)
-                            stmt.setInt(5, job.retries)
-                            stmt.setObject(6, job.maxRetries)
-                            stmt.setString(7, job.idempotencyKey)
-                            stmt.setLong(8, job.createdAt.toEpochMilli())
-                            stmt.setLong(9, job.updatedAt.toEpochMilli())
-                            stmt.setObject(10, job.lastAcquiredAt?.toEpochMilli())
-                            stmt.setString(11, job.acquiredByWorkerId)
-                            stmt.setLong(12, job.version)
-                            stmt.setBytes(13, job.inputData)
-                            stmt.setBytes(14, job.outputData)
+                            stmt.setString(2, job.groupId)
+                            stmt.setString(3, job.name)
+                            stmt.setString(4, job.type)
+                            stmt.setString(5, job.status.name)
+                            stmt.setInt(6, job.retries)
+                            stmt.setObject(7, job.maxRetries)
+                            stmt.setString(8, job.idempotencyKey)
+                            stmt.setLong(9, job.createdAt.toEpochMilli())
+                            stmt.setLong(10, job.updatedAt.toEpochMilli())
+                            stmt.setObject(11, job.lastAcquiredAt?.toEpochMilli())
+                            stmt.setString(12, job.acquiredByWorkerId)
+                            stmt.setLong(13, job.version)
+                            stmt.setBytes(14, job.inputData)
+                            stmt.setBytes(15, job.outputData)
                             stmt.executeUpdate()
                         }
                 }
             } catch (e: SQLException) {
-                if (e.matchesConstraint(CONSTRAINT_UQ_IDEMPOTENCY_KEY))
-                    throw DuplicateIdempotencyKeyException(job.idempotencyKey)
-                if (e.matchesConstraint(CONSTRAINT_JOBS_PK)) throw JobAlreadyExistsException(e)
+                if (e.matchesConstraint(CONSTRAINT_JOBS_PK))
+                    throw DuplicateIdempotencyKeyException(job.groupId, job.idempotencyKey)
                 throw e
             }
             job
         }
 
     override suspend fun acquirePendingJobs(
+        groupId: String,
+        type: String,
         workerId: String,
         limit: Int,
         eventFactory: ((Job) -> JobEvent)?,
@@ -77,12 +84,14 @@ class H2JobGateway(private val dataSource: DataSource) : JobGateway {
                     val jobs =
                         conn
                             .prepareStatement(
-                                "SELECT j.* FROM jobs j INNER JOIN workers w ON w.id = ? AND w.condemned = FALSE WHERE j.status = ? ORDER BY j.updated_at ASC LIMIT ? FOR UPDATE SKIP LOCKED"
+                                "SELECT j.* FROM jobs j INNER JOIN workers w ON w.id = ? AND w.condemned = FALSE WHERE j.group_id = ? AND j.type = ? AND j.status = ? ORDER BY j.updated_at ASC LIMIT ? FOR UPDATE SKIP LOCKED"
                             )
                             .use { stmt ->
                                 stmt.setString(1, workerId)
-                                stmt.setString(2, JobStatus.PENDING.name)
-                                stmt.setInt(3, limit)
+                                stmt.setString(2, groupId)
+                                stmt.setString(3, type)
+                                stmt.setString(4, JobStatus.PENDING.name)
+                                stmt.setInt(5, limit)
                                 stmt.executeQuery().use { rs -> rs.mapToJobs() }
                             }
 
@@ -147,13 +156,18 @@ class H2JobGateway(private val dataSource: DataSource) : JobGateway {
             }
         }
 
-    override suspend fun findJobByIdempotencyKey(idempotencyKey: String): Job? =
+    override suspend fun findJobByIdempotencyKey(groupId: String, idempotencyKey: String): Job? =
         withContext(Dispatchers.IO) {
             dataSource.connection.use { conn ->
-                conn.prepareStatement("SELECT * FROM jobs WHERE idempotency_key = ?").use { stmt ->
-                    stmt.setString(1, idempotencyKey)
-                    stmt.executeQuery().use { rs -> if (rs.next()) rs.toJob() else null }
-                }
+                conn
+                    .prepareStatement(
+                        "SELECT * FROM jobs WHERE group_id = ? AND idempotency_key = ?"
+                    )
+                    .use { stmt ->
+                        stmt.setString(1, groupId)
+                        stmt.setString(2, idempotencyKey)
+                        stmt.executeQuery().use { rs -> if (rs.next()) rs.toJob() else null }
+                    }
             }
         }
 
@@ -206,23 +220,24 @@ class H2JobGateway(private val dataSource: DataSource) : JobGateway {
                 try {
                     conn
                         .prepareStatement(
-                            "INSERT INTO jobs (id, name, type, status, retries, max_retries, idempotency_key, created_at, updated_at, last_acquired_at, acquired_by_worker_id, version, input_data, output_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                            "INSERT INTO jobs (id, group_id, name, type, status, retries, max_retries, idempotency_key, created_at, updated_at, last_acquired_at, acquired_by_worker_id, version, input_data, output_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                         )
                         .use { stmt ->
                             stmt.setString(1, job.id)
-                            stmt.setString(2, job.name)
-                            stmt.setString(3, job.type)
-                            stmt.setString(4, job.status.name)
-                            stmt.setInt(5, job.retries)
-                            stmt.setObject(6, job.maxRetries)
-                            stmt.setString(7, job.idempotencyKey)
-                            stmt.setLong(8, job.createdAt.toEpochMilli())
-                            stmt.setLong(9, job.updatedAt.toEpochMilli())
-                            stmt.setObject(10, job.lastAcquiredAt?.toEpochMilli())
-                            stmt.setString(11, job.acquiredByWorkerId)
-                            stmt.setLong(12, job.version)
-                            stmt.setBytes(13, job.inputData)
-                            stmt.setBytes(14, job.outputData)
+                            stmt.setString(2, job.groupId)
+                            stmt.setString(3, job.name)
+                            stmt.setString(4, job.type)
+                            stmt.setString(5, job.status.name)
+                            stmt.setInt(6, job.retries)
+                            stmt.setObject(7, job.maxRetries)
+                            stmt.setString(8, job.idempotencyKey)
+                            stmt.setLong(9, job.createdAt.toEpochMilli())
+                            stmt.setLong(10, job.updatedAt.toEpochMilli())
+                            stmt.setObject(11, job.lastAcquiredAt?.toEpochMilli())
+                            stmt.setString(12, job.acquiredByWorkerId)
+                            stmt.setLong(13, job.version)
+                            stmt.setBytes(14, job.inputData)
+                            stmt.setBytes(15, job.outputData)
                             stmt.executeUpdate()
                         }
                     insertEventStatement(conn, event)
@@ -230,9 +245,8 @@ class H2JobGateway(private val dataSource: DataSource) : JobGateway {
                     job
                 } catch (e: SQLException) {
                     conn.rollback()
-                    if (e.matchesConstraint(CONSTRAINT_UQ_IDEMPOTENCY_KEY))
-                        throw DuplicateIdempotencyKeyException(job.idempotencyKey)
-                    if (e.matchesConstraint(CONSTRAINT_JOBS_PK)) throw JobAlreadyExistsException(e)
+                    if (e.matchesConstraint(CONSTRAINT_JOBS_PK))
+                        throw DuplicateIdempotencyKeyException(job.groupId, job.idempotencyKey)
                     throw e
                 } catch (e: Exception) {
                     conn.rollback()
@@ -599,6 +613,7 @@ class H2JobGateway(private val dataSource: DataSource) : JobGateway {
         val maxRetries = getObject("max_retries") as? Int
         return Job(
             id = getString("id"),
+            groupId = getString("group_id"),
             name = getString("name"),
             type = getString("type"),
             status = JobStatus.valueOf(getString("status")),

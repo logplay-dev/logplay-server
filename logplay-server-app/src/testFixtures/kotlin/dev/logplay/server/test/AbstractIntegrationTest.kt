@@ -86,6 +86,7 @@ abstract class AbstractIntegrationTest {
                 assertThat(body.getString("updatedAt")).isNotBlank()
                 assertThat(body.getString("lastAcquiredAt")).isNull()
                 assertThat(body.getString("acquiredByWorkerId")).isNull()
+                assertThat(body.getString("groupId")).isEqualTo("test-group")
                 testContext.completeNow()
             } catch (e: Throwable) {
                 testContext.failNow(e)
@@ -662,6 +663,7 @@ abstract class AbstractIntegrationTest {
                             JsonObject()
                                 .put("name", "test")
                                 .put("type", "render")
+                                .put("groupId", "test-group")
                                 .put("maxRetries", 0)
                         )
                         .coAwait()
@@ -706,6 +708,7 @@ abstract class AbstractIntegrationTest {
                             JsonObject()
                                 .put("name", "job-2")
                                 .put("type", "render")
+                                .put("groupId", "test-group")
                                 .put("idempotencyKey", "dup-key")
                         )
                         .coAwait()
@@ -718,14 +721,211 @@ abstract class AbstractIntegrationTest {
     }
 
     @Test
-    fun `should auto-generate idempotency key when not provided`(
+    fun `should return 400 when idempotency key is missing`(
         vertx: Vertx,
         testContext: VertxTestContext,
     ) {
         CoroutineScope(vertx.dispatcher()).launch {
             try {
-                val job = createJob("test", "render")
-                assertThat(job.getString("idempotencyKey")).isNotBlank()
+                val response =
+                    client
+                        .post(port, "localhost", "/api/v1/jobs")
+                        .sendJsonObject(
+                            JsonObject()
+                                .put("name", "job")
+                                .put("type", "render")
+                                .put("groupId", "test-group")
+                        )
+                        .coAwait()
+                assertThat(response.statusCode()).isEqualTo(400)
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    // --- Group isolation ---
+
+    @Test
+    fun `should allow same idempotency key in different groups`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val responseA =
+                    client
+                        .post(port, "localhost", "/api/v1/jobs")
+                        .sendJsonObject(
+                            JsonObject()
+                                .put("name", "job-a")
+                                .put("type", "render")
+                                .put("idempotencyKey", "K")
+                                .put("groupId", "A")
+                        )
+                        .coAwait()
+                assertThat(responseA.statusCode()).isEqualTo(201)
+
+                val responseB =
+                    client
+                        .post(port, "localhost", "/api/v1/jobs")
+                        .sendJsonObject(
+                            JsonObject()
+                                .put("name", "job-b")
+                                .put("type", "render")
+                                .put("idempotencyKey", "K")
+                                .put("groupId", "B")
+                        )
+                        .coAwait()
+                assertThat(responseB.statusCode()).isEqualTo(201)
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `should return 409 for duplicate idempotency key within same group`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val first =
+                    client
+                        .post(port, "localhost", "/api/v1/jobs")
+                        .sendJsonObject(
+                            JsonObject()
+                                .put("name", "job-1")
+                                .put("type", "render")
+                                .put("idempotencyKey", "K")
+                                .put("groupId", "A")
+                        )
+                        .coAwait()
+                assertThat(first.statusCode()).isEqualTo(201)
+
+                val second =
+                    client
+                        .post(port, "localhost", "/api/v1/jobs")
+                        .sendJsonObject(
+                            JsonObject()
+                                .put("name", "job-2")
+                                .put("type", "render")
+                                .put("idempotencyKey", "K")
+                                .put("groupId", "A")
+                        )
+                        .coAwait()
+                assertThat(second.statusCode()).isEqualTo(409)
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `should only acquire jobs from the requested group`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val workerId = registerWorker()
+                createJob("job-a1", "render", groupId = "A")
+                createJob("job-a2", "render", groupId = "A")
+                createJob("job-b1", "render", groupId = "B")
+
+                val acquiredA = acquireJobs(workerId, 10, groupId = "A")
+                assertThat(acquiredA).hasSize(2)
+                for (job in acquiredA) {
+                    assertThat(job.getString("groupId")).isEqualTo("A")
+                }
+
+                val acquiredB = acquireJobs(workerId, 10, groupId = "B")
+                assertThat(acquiredB).hasSize(1)
+                for (job in acquiredB) {
+                    assertThat(job.getString("groupId")).isEqualTo("B")
+                }
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    // --- Type filtering ---
+
+    @Test
+    fun `should only acquire jobs matching the requested type`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val workerId = registerWorker()
+                createJob("render-1", "render")
+                createJob("render-2", "render")
+                createJob("export-1", "export")
+
+                val acquired = acquireJobs(workerId, 10, type = "render")
+                assertThat(acquired).hasSize(2)
+                for (job in acquired) {
+                    assertThat(job.getString("type")).isEqualTo("render")
+                }
+
+                val acquiredExport = acquireJobs(workerId, 10, type = "export")
+                assertThat(acquiredExport).hasSize(1)
+                for (job in acquiredExport) {
+                    assertThat(job.getString("type")).isEqualTo("export")
+                }
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `should acquire jobs matching both groupId and type`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val workerId = registerWorker()
+                createJob("match", "render", groupId = "A")
+                createJob("wrong-group", "render", groupId = "B")
+                createJob("wrong-type", "export", groupId = "A")
+
+                val acquired = acquireJobs(workerId, 10, groupId = "A", type = "render")
+                assertThat(acquired).hasSize(1)
+                assertThat(acquired[0].getString("groupId")).isEqualTo("A")
+                assertThat(acquired[0].getString("type")).isEqualTo("render")
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `should return 400 when type is missing from acquire request`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val workerId = registerWorker()
+                val response =
+                    client
+                        .post(port, "localhost", "/api/v1/jobs/acquire")
+                        .sendJsonObject(
+                            JsonObject().put("workerId", workerId).put("groupId", "test-group")
+                        )
+                        .coAwait()
+                assertThat(response.statusCode()).isEqualTo(400)
                 testContext.completeNow()
             } catch (e: Throwable) {
                 testContext.failNow(e)
@@ -1019,6 +1219,7 @@ abstract class AbstractIntegrationTest {
                             JsonObject()
                                 .put("name", "job-2")
                                 .put("type", "render")
+                                .put("groupId", "test-group")
                                 .put("idempotencyKey", "unique-key-123")
                         )
                         .coAwait()
@@ -1345,7 +1546,11 @@ abstract class AbstractIntegrationTest {
                     client
                         .post(port, "localhost", "/api/v1/jobs/acquire")
                         .sendJsonObject(
-                            JsonObject().put("workerId", "non-existent").put("limit", 10)
+                            JsonObject()
+                                .put("workerId", "non-existent")
+                                .put("limit", 10)
+                                .put("groupId", "test-group")
+                                .put("type", "render")
                         )
                         .coAwait()
                 assertThat(response.statusCode()).isEqualTo(404)
@@ -1429,7 +1634,50 @@ abstract class AbstractIntegrationTest {
                 val response =
                     client
                         .post(port, "localhost", "/api/v1/jobs")
-                        .sendJsonObject(JsonObject().put("name", "test"))
+                        .sendJsonObject(
+                            JsonObject().put("name", "test").put("groupId", "test-group")
+                        )
+                        .coAwait()
+                assertThat(response.statusCode()).isEqualTo(400)
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `should return 400 when creating job without groupId`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val response =
+                    client
+                        .post(port, "localhost", "/api/v1/jobs")
+                        .sendJsonObject(JsonObject().put("name", "test").put("type", "render"))
+                        .coAwait()
+                assertThat(response.statusCode()).isEqualTo(400)
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `should return 400 when acquiring jobs without groupId`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val workerId = registerWorker()
+                val response =
+                    client
+                        .post(port, "localhost", "/api/v1/jobs/acquire")
+                        .sendJsonObject(JsonObject().put("workerId", workerId).put("limit", 10))
                         .coAwait()
                 assertThat(response.statusCode()).isEqualTo(400)
                 testContext.completeNow()
@@ -1449,7 +1697,7 @@ abstract class AbstractIntegrationTest {
                 val response =
                     client
                         .post(port, "localhost", "/api/v1/jobs/acquire")
-                        .sendJsonObject(JsonObject().put("limit", 10))
+                        .sendJsonObject(JsonObject().put("limit", 10).put("groupId", "test-group"))
                         .coAwait()
                 assertThat(response.statusCode()).isEqualTo(400)
                 testContext.completeNow()
@@ -1511,7 +1759,12 @@ abstract class AbstractIntegrationTest {
                 val response =
                     client
                         .post(port, "localhost", "/api/v1/jobs")
-                        .sendJsonObject(JsonObject().put("name", "test").put("type", "  "))
+                        .sendJsonObject(
+                            JsonObject()
+                                .put("name", "test")
+                                .put("type", "  ")
+                                .put("groupId", "test-group")
+                        )
                         .coAwait()
                 assertThat(response.statusCode()).isEqualTo(400)
                 assertThat(response.bodyAsJsonObject().getString("error")).isNotBlank()
@@ -1833,25 +2086,41 @@ abstract class AbstractIntegrationTest {
 
     private suspend fun createJob(
         name: String = "test-job",
-        type: String = "test-type",
+        type: String = "render",
         maxRetries: Int? = null,
-        idempotencyKey: String? = null,
+        idempotencyKey: String = UUID.randomUUID().toString(),
         inputData: String? = null,
+        groupId: String = "test-group",
     ): JsonObject {
-        val body = JsonObject().put("name", name).put("type", type)
+        val body =
+            JsonObject()
+                .put("name", name)
+                .put("type", type)
+                .put("groupId", groupId)
+                .put("idempotencyKey", idempotencyKey)
         if (maxRetries != null) body.put("maxRetries", maxRetries)
-        if (idempotencyKey != null) body.put("idempotencyKey", idempotencyKey)
         if (inputData != null) body.put("inputData", inputData)
         val response = client.post(port, "localhost", "/api/v1/jobs").sendJsonObject(body).coAwait()
         assertThat(response.statusCode()).isEqualTo(201)
         return response.bodyAsJsonObject()
     }
 
-    private suspend fun acquireJobs(workerId: String, limit: Int = 10): List<JsonObject> {
+    private suspend fun acquireJobs(
+        workerId: String,
+        limit: Int = 10,
+        groupId: String = "test-group",
+        type: String = "render",
+    ): List<JsonObject> {
         val response =
             client
                 .post(port, "localhost", "/api/v1/jobs/acquire")
-                .sendJsonObject(JsonObject().put("workerId", workerId).put("limit", limit))
+                .sendJsonObject(
+                    JsonObject()
+                        .put("workerId", workerId)
+                        .put("limit", limit)
+                        .put("groupId", groupId)
+                        .put("type", type)
+                )
                 .coAwait()
         assertThat(response.statusCode()).isEqualTo(200)
         return response.bodyAsJsonArray().map { it as JsonObject }
@@ -1939,10 +2208,14 @@ abstract class AbstractIntegrationTest {
         return response.bodyAsJsonObject()
     }
 
-    private suspend fun createAndAcquireJob(inputData: String? = null): Pair<JsonObject, String> {
+    private suspend fun createAndAcquireJob(
+        inputData: String? = null,
+        groupId: String = "test-group",
+        type: String = "render",
+    ): Pair<JsonObject, String> {
         val workerId = registerWorker()
-        createJob(inputData = inputData)
-        val acquired = acquireJobs(workerId, 1)
+        createJob(inputData = inputData, groupId = groupId, type = type)
+        val acquired = acquireJobs(workerId, 1, groupId = groupId, type = type)
         assertThat(acquired).hasSize(1)
         return acquired[0] to workerId
     }

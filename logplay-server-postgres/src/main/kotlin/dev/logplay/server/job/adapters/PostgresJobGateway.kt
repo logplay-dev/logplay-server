@@ -13,27 +13,30 @@ import java.time.Instant
 class PostgresJobGateway(private val pool: Pool) : JobGateway {
 
     companion object {
+        // jobs.id is derived deterministically from (groupId, idempotencyKey) by
+        // JobIdGenerator, so a PK collision always means a duplicate idempotency
+        // key was submitted.
         private const val CONSTRAINT_JOBS_PK = "jobs_pkey"
-        private const val CONSTRAINT_UQ_IDEMPOTENCY_KEY = "uq_job_idempotency_key"
         private const val CONSTRAINT_FK_JOB_ACQUIRED_WORKER = "fk_job_acquired_worker"
+
+        // checkpoints.id is derived deterministically from (jobId, previousCheckpointId)
+        // by CheckpointIdGenerator, so a PK collision means a duplicate chain position
+        // was submitted.
+        private const val CONSTRAINT_CHECKPOINTS_PK = "checkpoints_pkey"
         private val CHECKPOINT_CONSTRAINTS =
-            setOf(
-                "uq_checkpoint_chain",
-                "uq_checkpoint_order",
-                "fk_checkpoint_job",
-                "fk_checkpoint_previous",
-            )
+            setOf(CONSTRAINT_CHECKPOINTS_PK, "fk_checkpoint_job", "fk_checkpoint_previous")
     }
 
     override suspend fun insertJob(job: Job): Job {
         try {
             pool
                 .preparedQuery(
-                    $$"INSERT INTO jobs (id, name, type, status, retries, max_retries, idempotency_key, created_at, updated_at, last_acquired_at, acquired_by_worker_id, version, input_data, output_data) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"
+                    $$"INSERT INTO jobs (id, group_id, name, type, status, retries, max_retries, idempotency_key, created_at, updated_at, last_acquired_at, acquired_by_worker_id, version, input_data, output_data) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
                 )
                 .execute(
                     Tuple.of(
                         job.id,
+                        job.groupId,
                         job.name,
                         job.type,
                         job.status.name,
@@ -51,15 +54,16 @@ class PostgresJobGateway(private val pool: Pool) : JobGateway {
                 )
                 .coAwait()
         } catch (e: PgException) {
-            if (e.constraint == CONSTRAINT_UQ_IDEMPOTENCY_KEY)
-                throw DuplicateIdempotencyKeyException(job.idempotencyKey)
-            if (e.constraint == CONSTRAINT_JOBS_PK) throw JobAlreadyExistsException(e)
+            if (e.constraint == CONSTRAINT_JOBS_PK)
+                throw DuplicateIdempotencyKeyException(job.groupId, job.idempotencyKey)
             throw e
         }
         return job
     }
 
     override suspend fun acquirePendingJobs(
+        groupId: String,
+        type: String,
         workerId: String,
         limit: Int,
         eventFactory: ((Job) -> JobEvent)?,
@@ -76,7 +80,7 @@ class PostgresJobGateway(private val pool: Pool) : JobGateway {
                             WITH acquired AS (
                                 SELECT j.id FROM jobs j
                                 INNER JOIN workers w ON w.id = $6 AND w.condemned = FALSE
-                                WHERE j.status = $1
+                                WHERE j.group_id = $7 AND j.type = $8 AND j.status = $1
                                 ORDER BY j.updated_at ASC
                                 LIMIT $2
                                 FOR UPDATE SKIP LOCKED
@@ -97,6 +101,8 @@ class PostgresJobGateway(private val pool: Pool) : JobGateway {
                                 now.toEpochMilli(),
                                 now.toEpochMilli(),
                                 workerId,
+                                groupId,
+                                type,
                             )
                         )
                         .coAwait()
@@ -128,11 +134,11 @@ class PostgresJobGateway(private val pool: Pool) : JobGateway {
         return if (rowSet.rowCount() > 0) rowSet.first().toJob() else null
     }
 
-    override suspend fun findJobByIdempotencyKey(idempotencyKey: String): Job? {
+    override suspend fun findJobByIdempotencyKey(groupId: String, idempotencyKey: String): Job? {
         val rowSet =
             pool
-                .preparedQuery($$"SELECT * FROM jobs WHERE idempotency_key = $1")
-                .execute(Tuple.of(idempotencyKey))
+                .preparedQuery($$"SELECT * FROM jobs WHERE group_id = $1 AND idempotency_key = $2")
+                .execute(Tuple.of(groupId, idempotencyKey))
                 .coAwait()
         return if (rowSet.rowCount() > 0) rowSet.first().toJob() else null
     }
@@ -177,11 +183,12 @@ class PostgresJobGateway(private val pool: Pool) : JobGateway {
             try {
                 conn
                     .preparedQuery(
-                        $$"INSERT INTO jobs (id, name, type, status, retries, max_retries, idempotency_key, created_at, updated_at, last_acquired_at, acquired_by_worker_id, version, input_data, output_data) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"
+                        $$"INSERT INTO jobs (id, group_id, name, type, status, retries, max_retries, idempotency_key, created_at, updated_at, last_acquired_at, acquired_by_worker_id, version, input_data, output_data) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
                     )
                     .execute(
                         Tuple.of(
                             job.id,
+                            job.groupId,
                             job.name,
                             job.type,
                             job.status.name,
@@ -203,9 +210,8 @@ class PostgresJobGateway(private val pool: Pool) : JobGateway {
                 return job
             } catch (e: PgException) {
                 tx.rollback().coAwait()
-                if (e.constraint == CONSTRAINT_UQ_IDEMPOTENCY_KEY)
-                    throw DuplicateIdempotencyKeyException(job.idempotencyKey)
-                if (e.constraint == CONSTRAINT_JOBS_PK) throw JobAlreadyExistsException(e)
+                if (e.constraint == CONSTRAINT_JOBS_PK)
+                    throw DuplicateIdempotencyKeyException(job.groupId, job.idempotencyKey)
                 throw e
             } catch (e: Exception) {
                 tx.rollback().coAwait()
@@ -547,6 +553,7 @@ class PostgresJobGateway(private val pool: Pool) : JobGateway {
     private fun Row.toJob(): Job =
         Job(
             id = getString("id"),
+            groupId = getString("group_id"),
             name = getString("name"),
             type = getString("type"),
             status = JobStatus.valueOf(getString("status")),

@@ -139,6 +139,7 @@ class ReleaseJobUseCaseTest {
     private fun aJob(status: JobStatus, acquiredByWorkerId: String? = null) =
         Job(
             id = UUID.randomUUID().toString(),
+            groupId = "test-group",
             name = "test-job",
             type = "test-type",
             status = status,
