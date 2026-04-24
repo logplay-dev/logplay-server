@@ -1,0 +1,48 @@
+[versions]
+vertx = "5.0.6"
+junit-jupiter = "5.10.0"
+assertj = "3.25.3"
+kotlinx-coroutines = "1.8.1"
+log4j = "2.24.3"
+h2 = "2.3.232"
+flyway = "11.5.0"
+postgresql = "42.7.5"
+testcontainers = "1.20.4"
+shadow = "9.2.2"
+
+[libraries]
+# Vert.x (versions managed by BOM)
+vertx-bom = { module = "io.vertx:vertx-stack-depchain", version.ref = "vertx" }
+vertx-lang-kotlin-coroutines = { module = "io.vertx:vertx-lang-kotlin-coroutines" }
+vertx-lang-kotlin = { module = "io.vertx:vertx-lang-kotlin" }
+vertx-config = { module = "io.vertx:vertx-config" }
+vertx-web = { module = "io.vertx:vertx-web" }
+vertx-web-client = { module = "io.vertx:vertx-web-client" }
+vertx-opentelemetry = { module = "io.vertx:vertx-opentelemetry" }
+vertx-grpc-server = { module = "io.vertx:vertx-grpc-server" }
+vertx-pg-client = { module = "io.vertx:vertx-pg-client" }
+vertx-junit5 = { module = "io.vertx:vertx-junit5" }
+jackson-module-kotlin = { module = "com.fasterxml.jackson.module:jackson-module-kotlin" }
+
+# Logging
+log4j-slf4j2-impl = { module = "org.apache.logging.log4j:log4j-slf4j2-impl", version.ref = "log4j" }
+
+# Testing
+junit-bom = { module = "org.junit:junit-bom", version.ref = "junit-jupiter" }
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit-jupiter" }
+junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }
+assertj-core = { module = "org.assertj:assertj-core", version.ref = "assertj" }
+kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "kotlinx-coroutines" }
+
+# Databases
+h2-database = { module = "com.h2database:h2", version.ref = "h2" }
+flyway-core = { module = "org.flywaydb:flyway-core", version.ref = "flyway" }
+flyway-postgresql = { module = "org.flywaydb:flyway-database-postgresql", version.ref = "flyway" }
+postgresql = { module = "org.postgresql:postgresql", version.ref = "postgresql" }
+
+# Testcontainers
+testcontainers-postgresql = { module = "org.testcontainers:postgresql", version.ref = "testcontainers" }
+testcontainers-junit-jupiter = { module = "org.testcontainers:junit-jupiter", version.ref = "testcontainers" }
+
+[plugins]
+shadow = { id = "com.gradleup.shadow", version.ref = "shadow" }

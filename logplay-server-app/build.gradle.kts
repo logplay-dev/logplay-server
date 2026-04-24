@@ -1,44 +1,36 @@
-import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
 import org.gradle.api.tasks.testing.logging.TestLogEvent.*
 
 plugins {
     id("kotlin-module-base")
-    application
-    id("com.gradleup.shadow") version "9.2.2"
+    `java-test-fixtures`
 }
 
 repositories {
     mavenCentral()
 }
 
-val vertxVersion = "5.0.6"
-val junitJupiterVersion = "5.9.1"
-
-val mainClassName = "dev.logplay.server.MainKt"
-
-application {
-    mainClass.set(mainClassName)
-}
-
 dependencies {
-    implementation(project(":logplay-server-core"))
-    implementation(platform("io.vertx:vertx-stack-depchain:$vertxVersion"))
-    implementation("io.vertx:vertx-launcher-application")
-    implementation("io.vertx:vertx-config")
-    implementation("io.vertx:vertx-web")
-    implementation("io.vertx:vertx-pg-client")
-    implementation("io.vertx:vertx-opentelemetry")
-    implementation("io.vertx:vertx-grpc-server")
-    implementation("io.vertx:vertx-lang-kotlin-coroutines")
-    implementation("io.vertx:vertx-lang-kotlin")
-    testImplementation("io.vertx:vertx-junit5")
-    testImplementation("org.junit.jupiter:junit-jupiter:$junitJupiterVersion")
-    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
-}
+    api(project(":logplay-server-domain"))
+    api(platform(libs.vertx.bom))
+    api(libs.vertx.lang.kotlin.coroutines)
+    api(libs.vertx.lang.kotlin)
+    implementation(libs.vertx.config)
+    implementation(libs.vertx.web)
+    implementation(libs.jackson.module.kotlin)
+    implementation(libs.vertx.opentelemetry)
+    implementation(libs.vertx.grpc.server)
+    implementation(libs.log4j.slf4j2.impl)
+    testImplementation(libs.vertx.junit5)
+    testImplementation(libs.junit.jupiter)
+    testRuntimeOnly(libs.junit.platform.launcher)
 
-tasks.withType<ShadowJar> {
-    archiveClassifier.set("fat")
-    mergeServiceFiles()
+    testFixturesImplementation(platform(libs.vertx.bom))
+    testFixturesImplementation(libs.vertx.web.client)
+    testFixturesImplementation(libs.vertx.junit5)
+    testFixturesImplementation(libs.junit.jupiter)
+    testFixturesRuntimeOnly(libs.junit.platform.launcher)
+    testFixturesImplementation(libs.assertj.core)
+    testFixturesImplementation(libs.kotlinx.coroutines.test)
 }
 
 tasks.withType<Test> {
