@@ -4,7 +4,7 @@ plugins {
 
 }
 
-group = "dev.logplay"
+group = "org.zeplinko.logplay"
 version = "0.0.1"
 
 repositories {

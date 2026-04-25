@@ -12,7 +12,7 @@ repositories {
 }
 
 application {
-    mainClass.set("dev.logplay.server.postgres.MainKt")
+    mainClass.set("org.zeplinko.logplay.server.postgres.MainKt")
 }
 
 dependencies {

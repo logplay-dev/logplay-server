@@ -27,7 +27,7 @@ data class Checkpoint(
     val name: String?,
     val createdAt: Instant,
     val orderKey: Long,
-    val data: ByteArray,
+    val data: ByteArray?,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -64,7 +64,7 @@ data class SaveJobCheckpointCommand(
     val workerId: String,
     val previousCheckpointId: String?,
     val name: String?,
-    val data: ByteArray,
+    val data: ByteArray?,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -86,7 +86,7 @@ data class SaveJobCheckpointCommand(
         result = 31 * result + workerId.hashCode()
         result = 31 * result + (previousCheckpointId?.hashCode() ?: 0)
         result = 31 * result + (name?.hashCode() ?: 0)
-        result = 31 * result + data.contentHashCode()
+        result = 31 * result + (data?.contentHashCode() ?: 0)
         return result
     }
 }
