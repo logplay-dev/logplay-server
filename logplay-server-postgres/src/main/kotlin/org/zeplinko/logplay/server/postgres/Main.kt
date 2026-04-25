@@ -23,6 +23,7 @@ fun main() {
     Flyway.configure()
         .dataSource("jdbc:postgresql://$dbHost:$dbPort/$dbName", dbUser, dbPassword)
         .locations("classpath:db/migration")
+        .defaultSchema("public")
         .load()
         .migrate()
 

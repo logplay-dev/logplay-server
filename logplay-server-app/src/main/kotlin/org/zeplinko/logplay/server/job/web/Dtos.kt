@@ -57,7 +57,7 @@ data class CheckpointResponse(
     val previousCheckpointId: String?,
     val name: String?,
     val createdAt: String,
-    val data: String,
+    val data: String?,
 )
 
 data class CheckpointPageResponse(val checkpoints: List<CheckpointResponse>, val hasMore: Boolean)
@@ -112,7 +112,7 @@ fun SaveCheckpointRequest.toCommand(jobId: String) =
             workerId = workerId ?: throw BlankWorkerIdException(),
             previousCheckpointId = previousCheckpointId,
             name = name,
-            data = Base64.getDecoder().decode(data ?: throw InvalidCheckpointDataException()),
+            data = data?.let { Base64.getDecoder().decode(it) },
         )
     } catch (_: IllegalArgumentException) {
         throw InvalidCheckpointDataException()
@@ -147,7 +147,7 @@ fun Checkpoint.toResponse() =
         previousCheckpointId = previousCheckpointId,
         name = name,
         createdAt = createdAt.toString(),
-        data = Base64.getEncoder().encodeToString(data),
+        data = data?.let { Base64.getEncoder().encodeToString(it) },
     )
 
 data class JobEventResponse(

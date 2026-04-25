@@ -32,7 +32,7 @@ This is a **Vert.x 5 + Kotlin** durable execution server using **clean architect
 
 ### Domain Model
 
-The domain is organized by feature (screaming architecture) under `logplay-server-domain/src/main/kotlin/dev/logplay/server/core/`:
+The domain is organized by feature (screaming architecture) under `logplay-server-domain/src/main/kotlin/org/zeplinko/logplay/server/core/`:
 
 **`job/`** — Job and checkpoint lifecycle. Jobs follow: `PENDING → ACQUIRED → FINISHED | FAILED | ABORTED`
 - `Models.kt` — `Job`, `Checkpoint`, and job command data classes
@@ -51,7 +51,7 @@ The domain is organized by feature (screaming architecture) under `logplay-serve
 
 ### App Layer
 
-Located in `logplay-server-app/src/main/kotlin/dev/logplay/server/`:
+Located in `logplay-server-app/src/main/kotlin/org/zeplinko/logplay/server/`:
 - `MainVerticle.kt` — Entry point, HTTP server on configurable port (default 8080)
 - `job/web/JobController.kt` — Job HTTP endpoint handlers
 - `job/web/Dtos.kt` — Job request/response DTOs

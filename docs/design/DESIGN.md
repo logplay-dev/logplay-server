@@ -1163,7 +1163,7 @@ Flyway runs automatically at application startup before the Vert.x verticle is d
 
 Custom Gradle convention plugins in `buildSrc/`:
 
-- **`module-base`**: Applies `java-library` + Spotless with ktfmt. Sets `group = "dev.logplay"`, `version = "0.0.1"`.
+- **`module-base`**: Applies `java-library` + Spotless with ktfmt. Sets `group = "org.zeplinko.logplay"`, `version = "0.0.1"`.
 - **`kotlin-module-base`**: Extends `module-base`, adds Kotlin JVM plugin, configures JDK 25 toolchain and Kotlin 2.3 language/API version.
 
 All submodules apply `kotlin-module-base` for consistent configuration.

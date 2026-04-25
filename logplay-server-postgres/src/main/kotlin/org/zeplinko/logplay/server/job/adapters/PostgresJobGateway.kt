@@ -298,7 +298,7 @@ class PostgresJobGateway(private val pool: Pool) : JobGateway {
                             checkpoint.name,
                             checkpoint.createdAt.toEpochMilli(),
                             checkpoint.orderKey,
-                            Buffer.buffer(checkpoint.data),
+                            checkpoint.data?.let { Buffer.buffer(it) },
                         )
                     )
                     .coAwait()
@@ -535,7 +535,7 @@ class PostgresJobGateway(private val pool: Pool) : JobGateway {
             name = getString("name"),
             createdAt = Instant.ofEpochMilli(getLong("created_at")),
             orderKey = getLong("order_key"),
-            data = getBuffer("data").bytes,
+            data = getBuffer("data")?.bytes,
         )
 
     private fun Row.toJobEvent(): JobEvent =

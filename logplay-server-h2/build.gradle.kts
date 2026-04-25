@@ -12,7 +12,7 @@ repositories {
 }
 
 application {
-    mainClass.set("dev.logplay.server.h2.MainKt")
+    mainClass.set("org.zeplinko.logplay.server.h2.MainKt")
 }
 
 dependencies {

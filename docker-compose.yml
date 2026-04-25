@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: logplay-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-logplay}
+      POSTGRES_USER: ${DB_USER:-logplay}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-logplay}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - logplay_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-logplay} -d ${DB_NAME:-logplay}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  logplay_pg_data:
+    name: logplay_pg_data

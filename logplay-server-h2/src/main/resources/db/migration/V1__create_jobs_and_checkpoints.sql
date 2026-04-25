@@ -23,7 +23,7 @@ CREATE TABLE checkpoints (
     name VARCHAR(256),
     created_at BIGINT NOT NULL,
     order_key BIGINT NOT NULL DEFAULT 0,
-    data BINARY VARYING NOT NULL,
+    data BINARY VARYING NULL,
     CONSTRAINT fk_checkpoint_job FOREIGN KEY (job_id) REFERENCES jobs(id),
     CONSTRAINT fk_checkpoint_previous FOREIGN KEY (previous_checkpoint_id) REFERENCES checkpoints(id)
 );
