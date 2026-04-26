@@ -80,13 +80,13 @@ A checkpoint is a durable snapshot of execution progress saved by the client SDK
 | Field | Required | Description |
 |-------|----------|-------------|
 | `jobId` | yes | The job this checkpoint belongs to |
-| `previousCheckpointId` | yes | ID of the preceding checkpoint (`null` for the first) |
-| `classType` | yes | Fully-qualified class name of the payload — used by the client SDK to deserialize `data` back into the correct type on resume |
-| `data` | yes | Serialized payload (`ByteArray`) |
-| `description` | no | Optional human-readable step name (e.g. `"payment-processed"`) |
+| `previousCheckpointId` | no | ID of the preceding checkpoint (`null` for the first) |
+| `name` | no | Optional human-readable step name (e.g. `"payment-processed"`) |
+| `data` | no | Serialized payload (`ByteArray`); may be omitted for chain-marker checkpoints |
 | `createdAt` | yes | When the checkpoint was saved |
+| `orderKey` | yes | Monotonically increasing order within a job (server-assigned) |
 
-If a client process dies mid-execution, the next client to pick up the job fetches the existing checkpoints and resumes from the last saved state by deserializing `data` using `classType`.
+If a client process dies mid-execution, the next client to pick up the job fetches the existing checkpoints via cursor-based pagination and resumes from the last saved state. Payload schema/typing is the SDK's responsibility — the server stores `data` as opaque bytes.
 
 ---
 
@@ -123,7 +123,7 @@ All endpoints are versioned under `/api/v1`. Routes are mounted via Vert.x sub-r
 ```
 logplay-server/
 ├── logplay-server-domain/     ← pure domain logic, zero framework dependencies
-│   └── src/main/kotlin/dev/logplay/server/core/job/
+│   └── src/main/kotlin/org/zeplinko/logplay/server/core/job/
 │       ├── Enums.kt           ← JobStatus
 │       ├── Models.kt          ← Job, Checkpoint, command records
 │       ├── Ports.kt           ← JobGateway interface

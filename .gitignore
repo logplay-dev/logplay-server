@@ -188,4 +188,4 @@ nbdist/
 
 .claude/projects
 .claude/settings.local.json
-
+.kotlin

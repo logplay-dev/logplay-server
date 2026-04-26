@@ -1,7 +1,7 @@
 # LogPlay Server - Detailed Design Document
 
 > **Version:** 0.0.1  
-> **Last updated:** 2026-04-10  
+> **Last updated:** 2026-04-26  
 > **Status:** Living document reflecting the current implementation
 
 ---
@@ -103,7 +103,7 @@ block-beta
 ### logplay-server-domain
 
 ```
-src/main/kotlin/dev/logplay/server/core/
+src/main/kotlin/org/zeplinko/logplay/server/core/
 ├── job/
 │   ├── Models.kt          # Job, Checkpoint, command/response data classes
 │   ├── Enums.kt           # JobStatus, JobEventType, ActorType
@@ -135,7 +135,7 @@ src/main/kotlin/dev/logplay/server/core/
 ### logplay-server-app
 
 ```
-src/main/kotlin/dev/logplay/server/
+src/main/kotlin/org/zeplinko/logplay/server/
 ├── MainVerticle.kt                    # Vert.x entry point, HTTP server, cleanup scheduler
 ├── web/
 │   └── Http.kt                        # ErrorResponse, request parsing utilities
@@ -152,7 +152,7 @@ src/main/kotlin/dev/logplay/server/
     └── use/case/
         └── WorkerUseCaseLookUp.kt     # Worker use case factory
 
-src/testFixtures/kotlin/dev/logplay/server/test/
+src/testFixtures/kotlin/org/zeplinko/logplay/server/test/
 ├── AbstractIntegrationTest.kt         # 70+ shared integration test cases
 └── IntegrationTestBackend.kt          # Backend abstraction for tests
 ```
@@ -160,7 +160,7 @@ src/testFixtures/kotlin/dev/logplay/server/test/
 ### logplay-server-h2 / logplay-server-postgres
 
 ```
-src/main/kotlin/dev/logplay/server/
+src/main/kotlin/org/zeplinko/logplay/server/
 ├── {h2,postgres}/
 │   └── Main.kt                        # Application entry point
 └── job/adapters/
@@ -170,7 +170,7 @@ src/main/kotlin/dev/logplay/server/
 src/main/resources/db/migration/
 └── V1__create_jobs_and_checkpoints.sql # Flyway schema migration
 
-src/test/kotlin/dev/logplay/server/{h2,postgres}/
+src/test/kotlin/org/zeplinko/logplay/server/{h2,postgres}/
 ├── {H2,Postgres}IntegrationTest.kt    # Integration test runner
 └── {H2,Postgres}TestBackend.kt        # Test backend setup
 ```
@@ -223,7 +223,7 @@ data class Checkpoint(
     val name: String?,                   // Optional human-readable step name (max 256 chars)
     val createdAt: Instant,
     val orderKey: Long,                  // Monotonically increasing order within a job
-    val data: ByteArray,                 // Serialized checkpoint payload
+    val data: ByteArray?,                // Serialized checkpoint payload (nullable — workers may save chain markers without payloads)
 )
 ```
 
@@ -277,7 +277,7 @@ All use case inputs are modeled as immutable command objects:
 |---------|--------|
 | `CreateJobCommand` | groupId, name, type, maxRetries?, idempotencyKey, inputData? |
 | `AcquirePendingJobsCommand` | groupId, type, workerId, limit |
-| `SaveJobCheckpointCommand` | jobId, workerId, previousCheckpointId?, name?, data |
+| `SaveJobCheckpointCommand` | jobId, workerId, previousCheckpointId?, name?, data? |
 | `GetCheckpointsCommand` | jobId, after? (cursor), limit? |
 | `CompleteJobCommand` | jobId, workerId, outputData? |
 | `ReleaseJobCommand` | jobId, workerId |
@@ -417,7 +417,7 @@ The database enforces a unique constraint on `(job_id, COALESCE(previous_checkpo
 
 ### Save Checkpoint Flow
 
-1. Validate inputs (jobId, workerId, name length, data)
+1. Validate inputs (jobId, workerId, name length)
 2. Lock the job row (`SELECT FOR UPDATE`)
 3. Verify job is `ACQUIRED` and owned by the requesting worker
 4. Fetch the latest checkpoint for the job
@@ -602,7 +602,7 @@ Save a new checkpoint.
 | `workerId` | yes | - | Must own the job |
 | `previousCheckpointId` | no | null | Must match the last checkpoint |
 | `name` | no | null | Max 256 chars |
-| `data` | yes | - | Valid Base64 |
+| `data` | no | null | Valid Base64 if provided |
 
 **Response (201):** Created `Checkpoint` object.
 
@@ -834,7 +834,7 @@ Idempotency uniqueness is enforced by the primary key: `jobs.id` is derived dete
 | `name` | VARCHAR(256) | NULLABLE |
 | `created_at` | BIGINT | NOT NULL (epoch ms) |
 | `order_key` | BIGINT | NOT NULL, DEFAULT 0 |
-| `data` | BINARY VARYING / BYTEA | NOT NULL |
+| `data` | BINARY VARYING / BYTEA | NULLABLE |
 
 **Indexes & Constraints:**
 - `idx_checkpoints_job_order` on `(job_id, order_key)` -- query performance for pagination

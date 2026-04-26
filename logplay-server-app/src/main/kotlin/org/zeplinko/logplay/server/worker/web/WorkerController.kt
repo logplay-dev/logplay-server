@@ -7,8 +7,18 @@ import org.zeplinko.logplay.server.core.worker.*
 import org.zeplinko.logplay.server.web.parseBody
 import org.zeplinko.logplay.server.worker.use.case.WorkerUseCaseLookUp
 
+/**
+ * REST handlers for the `/workers` family of endpoints. Domain exceptions bubble to the central
+ * error handler in `MainVerticle` for HTTP status mapping.
+ */
 class WorkerController(private val useCases: WorkerUseCaseLookUp) {
 
+    /**
+     * Mounts every worker route on `router`. Endpoints registered:
+     * - `POST /workers` — register a worker (201)
+     * - `POST /workers/:workerId/heartbeat` — refresh liveness (200; 403 if condemned)
+     * - `DELETE /workers/:workerId` — graceful deregister, releasing held jobs (204)
+     */
     fun registerRoutes(router: Router, support: CoroutineRouterSupport): Unit =
         with(support) {
             router.post("/workers").coHandler(requestHandler = ::registerWorker)

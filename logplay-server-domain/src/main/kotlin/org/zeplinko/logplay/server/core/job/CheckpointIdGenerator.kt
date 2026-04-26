@@ -3,6 +3,12 @@ package org.zeplinko.logplay.server.core.job
 import java.util.UUID
 import org.zeplinko.logplay.server.core.UUIDv5
 
+/**
+ * Derives stable checkpoint ids from `(jobId, previousCheckpointId)` using UUIDv5 over a fixed
+ * LogPlay namespace. Determinism is what makes the primary key alone sufficient to enforce chain
+ * uniqueness: two writers attempting to insert at the same chain position collide on the PK and the
+ * gateway translates the collision into [InvalidCheckpointOrderException].
+ */
 object CheckpointIdGenerator {
 
     // DO NOT CHANGE. This namespace is baked into every derived checkpoint id.
@@ -17,6 +23,11 @@ object CheckpointIdGenerator {
     // persisted.
     private const val ROOT_SENTINEL = "ROOT"
 
+    /**
+     * Returns the deterministic checkpoint id for the given chain position. `null`
+     * `previousCheckpointId` is encoded as the literal sentinel "ROOT" — that sentinel must never
+     * change once any rows have been persisted.
+     */
     fun fromChainPosition(jobId: String, previousCheckpointId: String?): String {
         val name = UUIDv5.encodeName(jobId, previousCheckpointId ?: ROOT_SENTINEL)
         return UUIDv5.generate(LOGPLAY_CHECKPOINT_NAMESPACE, name).toString()
