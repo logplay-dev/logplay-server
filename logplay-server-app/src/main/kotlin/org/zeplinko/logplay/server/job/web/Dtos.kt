@@ -28,8 +28,14 @@ data class AcquireJobsRequest(
 /** Request body for `POST /api/v1/jobs/:jobId/complete`. `outputData` is Base64-encoded. */
 data class CompleteJobRequest(val workerId: String? = null, val outputData: String? = null)
 
-/** Request body for `POST /api/v1/jobs/:jobId/release`. */
-data class ReleaseJobRequest(val workerId: String? = null)
+/**
+ * Request body for `POST /api/v1/jobs/:jobId/release`.
+ *
+ * @property availableAt optional epoch-millis floor for re-acquisition. `null` (or `0`) means the
+ *   job becomes available immediately. Used by SDK sleep to defer re-acquisition until a wake-at
+ *   deadline; the server treats it purely as a "don't pick this back up before T" hint.
+ */
+data class ReleaseJobRequest(val workerId: String? = null, val availableAt: Long? = null)
 
 /**
  * Request body for `POST /api/v1/jobs/:jobId/error`. The optional `error` is recorded on the
@@ -58,16 +64,16 @@ data class JobResponse(
     val name: String,
     val type: String,
     val status: String,
-    val retries: Int,
+    val retries: Int?,
     val maxRetries: Int?,
-    val idempotencyKey: String,
     val createdAt: String,
     val updatedAt: String,
     val lastAcquiredAt: String?,
     val acquiredByWorkerId: String?,
+    val availableAt: Long?,
+    val terminalAt: String?,
     val inputData: String?,
     val outputData: String?,
-    val version: Long,
 )
 
 /**
@@ -141,7 +147,11 @@ fun CompleteJobRequest.toCommand(jobId: String) =
 
 /** @throws BlankWorkerIdException if `workerId` is missing. */
 fun ReleaseJobRequest.toCommand(jobId: String) =
-    ReleaseJobCommand(jobId = jobId, workerId = workerId ?: throw BlankWorkerIdException())
+    ReleaseJobCommand(
+        jobId = jobId,
+        workerId = workerId ?: throw BlankWorkerIdException(),
+        availableAt = availableAt,
+    )
 
 /** @throws BlankWorkerIdException if `workerId` is missing. */
 fun ReportExecutionErrorRequest.toCommand(jobId: String) =
@@ -180,14 +190,14 @@ fun Job.toResponse() =
         status = status.name,
         retries = retries,
         maxRetries = maxRetries,
-        idempotencyKey = idempotencyKey,
         createdAt = createdAt.toString(),
         updatedAt = updatedAt.toString(),
         lastAcquiredAt = lastAcquiredAt?.toString(),
         acquiredByWorkerId = acquiredByWorkerId,
+        availableAt = availableAt,
+        terminalAt = terminalAt?.toString(),
         inputData = inputData?.let { Base64.getEncoder().encodeToString(it) },
         outputData = outputData?.let { Base64.getEncoder().encodeToString(it) },
-        version = version,
     )
 
 /** Converts a [CheckpointPage] to its wire response. */

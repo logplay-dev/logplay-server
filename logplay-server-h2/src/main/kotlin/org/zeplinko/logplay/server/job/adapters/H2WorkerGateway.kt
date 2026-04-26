@@ -13,7 +13,9 @@ import org.zeplinko.logplay.server.core.worker.WorkerGateway
 class H2WorkerGateway(private val dataSource: DataSource) : WorkerGateway {
 
     companion object {
-        private const val CONSTRAINT_WORKERS_PK = "PRIMARY KEY ON PUBLIC.WORKERS"
+        // H2 auto-numbers the PK constraint name (e.g. PRIMARY_KEY_8); we match on the stable
+        // column reference instead, mirroring how H2JobGateway identifies its PK violations.
+        private const val CONSTRAINT_WORKERS_PK = "PUBLIC.WORKERS(ID)"
     }
 
     override suspend fun insertWorker(worker: Worker): Worker =

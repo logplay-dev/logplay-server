@@ -3,19 +3,32 @@ package org.zeplinko.logplay.server.core.job
 import java.time.Instant
 
 /**
- * The central durable-execution aggregate. A job moves through the [JobStatus] lifecycle and
- * accumulates checkpoints and events along the way.
+ * The central durable-execution aggregate. A job moves through the [JobStatus] lifecycle, with
+ * state transitions stored as moves between three tables: `jobs` (authoritative metadata),
+ * `job_queue` (PENDING references), and `job_acquired` (ACQUIRED references). The `Job` model is a
+ * denormalised read view assembled by the gateway — `status`, `retries`, `acquiredByWorkerId`,
+ * `lastAcquiredAt`, and `availableAt` are populated from the table where the job currently lives.
  *
- * @property id deterministic id derived from `(groupId, idempotencyKey)` via [JobIdGenerator].
+ * @property id deterministic id derived from `(groupId, idempotencyKey)` via [JobIdGenerator]. The
+ *   idempotency key itself is not stored on the server — uniqueness within `groupId` is enforced
+ *   transitively by the primary key on this id.
  * @property groupId multi-tenant scope; workers acquire jobs by `(groupId, type)`.
+ * @property retries number of times the job has been re-enqueued after a worker error. Sourced from
+ *   `job_queue.retries` while PENDING and from `job_acquired.retries` while ACQUIRED. `null` for
+ *   terminal jobs — the count isn't preserved on the `jobs` table once the job leaves the secondary
+ *   tables, and the audit trail (`job_events`) is the source of truth for historical retry counts.
  * @property maxRetries `null` means unlimited retries; otherwise the job transitions to `FAILED`
  *   when `retries` reaches this bound.
- * @property idempotencyKey unique within `groupId`; collisions are rejected, not deduped.
  * @property inputData opaque, base64-transcoded on the wire; the server never inspects its shape.
- * @property lastAcquiredAt last time a worker acquired this job; null until first acquisition.
- * @property acquiredByWorkerId set while `status = ACQUIRED`; cleared on release/complete/abort.
+ * @property lastAcquiredAt only populated while `status = ACQUIRED` (mirrors
+ *   `job_acquired.acquired_at`); `null` for every other state. Historical acquisition timestamps
+ *   are recoverable from job events.
+ * @property acquiredByWorkerId set while `status = ACQUIRED`; `null` for every other state.
+ * @property availableAt epoch-millis floor for re-acquisition; populated only while `status =
+ *   PENDING`. `0` means "no deadline / always acquirable." Used by sleep-driven release.
+ * @property terminalAt set when `status` is terminal (`FINISHED`, `FAILED`, `ABORTED`); the moment
+ *   the terminal transition was recorded.
  * @property outputData populated only on `FINISHED`; opaque bytes.
- * @property version optimistic-locking counter; bumped on every mutation.
  */
 data class Job(
     val id: String,
@@ -23,16 +36,16 @@ data class Job(
     val name: String,
     val type: String,
     val status: JobStatus,
-    val retries: Int,
+    val retries: Int?,
     val maxRetries: Int? = null,
-    val idempotencyKey: String,
     val inputData: ByteArray? = null,
     val createdAt: Instant,
     val updatedAt: Instant,
     val lastAcquiredAt: Instant? = null,
     val acquiredByWorkerId: String? = null,
+    val availableAt: Long? = null,
+    val terminalAt: Instant? = null,
     val outputData: ByteArray? = null,
-    val version: Long,
 )
 
 /**
@@ -72,6 +85,22 @@ data class Checkpoint(
         return id.hashCode()
     }
 }
+
+/**
+ * Insertion-time projection of a [Job] — only the fields that are authoritative when a job is first
+ * created. State (`status`, `retries`, `availableAt`, ...) is implicit (a freshly inserted job is
+ * always PENDING with retries=0, availableAt=0); terminal fields and `outputData` don't exist yet.
+ * The gateway returns a fully assembled [Job] so callers don't have to round-trip.
+ */
+data class NewJob(
+    val id: String,
+    val groupId: String,
+    val name: String,
+    val type: String,
+    val maxRetries: Int? = null,
+    val inputData: ByteArray? = null,
+    val createdAt: Instant,
+)
 
 /** Input for [CreateJobUseCase]. See [Job] for field semantics. */
 data class CreateJobCommand(
@@ -153,8 +182,16 @@ data class CompleteJobCommand(
     val outputData: ByteArray? = null,
 )
 
-/** Input for [ReleaseJobUseCase]. */
-data class ReleaseJobCommand(val jobId: String, val workerId: String)
+/**
+ * Input for [ReleaseJobUseCase].
+ *
+ * @property availableAt optional epoch-millis floor for re-acquisition. `null` (or `0`) means the
+ *   job becomes available immediately. Non-zero values are used by SDK sleep to defer
+ *   re-acquisition until the wake-at deadline. The server treats this as a "don't pick this back up
+ *   before T" hint and never compares the value against its own clock for any purpose other than
+ *   the acquire gate.
+ */
+data class ReleaseJobCommand(val jobId: String, val workerId: String, val availableAt: Long? = null)
 
 /**
  * Input for [ReportExecutionErrorUseCase]. The optional `error` is recorded on the corresponding
@@ -178,7 +215,8 @@ data class ExecutionErrorResult(val status: JobStatus, val retries: Int, val eve
  * @property actorType `WORKER` for transitions initiated by a worker call, `SYSTEM` for
  *   server-initiated transitions (failure after max retries, abort, dead-worker cleanup).
  * @property actorId worker id when [actorType] is `WORKER`, otherwise `null`.
- * @property eventDetail extended free-form info — typically a stack trace for `ERROR_REPORTED`.
+ * @property eventDetail extended free-form info — typically a stack trace for `ERROR_REPORTED`, or
+ *   a JSON blob like `{"availableAt": <ms>}` for `RELEASED` events that carry a sleep deadline.
  */
 data class JobEvent(
     val id: String,

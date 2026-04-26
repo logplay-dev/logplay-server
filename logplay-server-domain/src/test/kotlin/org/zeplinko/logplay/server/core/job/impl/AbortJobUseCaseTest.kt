@@ -64,7 +64,9 @@ class AbortJobUseCaseTest {
         assertThat(result.id).isEqualTo(job.id)
         assertThat(result.name).isEqualTo(job.name)
         assertThat(result.type).isEqualTo(job.type)
-        assertThat(result.retries).isEqualTo(job.retries)
+        // retries is null for terminal jobs — the count isn't preserved on `jobs` once the
+        // secondary-table row is gone; audit events are the source of truth for past retries.
+        assertThat(result.retries).isNull()
     }
 
     // --- Validation ---
@@ -85,21 +87,25 @@ class AbortJobUseCaseTest {
     }
 
     @Test
-    fun `execute should throw JobNotAbortableException for terminal statuses`() = runTest {
-        for (status in listOf(JobStatus.FINISHED, JobStatus.FAILED, JobStatus.ABORTED)) {
-            val localGateway = InMemoryJobGateway()
-            val job = aJob(status)
-            localGateway.save(job)
+    fun `execute should throw JobNotAbortableException with the actual terminal status`() =
+        runTest {
+            for (status in listOf(JobStatus.FINISHED, JobStatus.FAILED, JobStatus.ABORTED)) {
+                val localGateway = InMemoryJobGateway()
+                val job = aJob(status)
+                localGateway.save(job)
 
-            val exception =
-                runCatching { AbortJobUseCaseImpl(localGateway).execute(AbortJobCommand(job.id)) }
-                    .exceptionOrNull()
+                val exception =
+                    runCatching {
+                            AbortJobUseCaseImpl(localGateway).execute(AbortJobCommand(job.id))
+                        }
+                        .exceptionOrNull()
 
-            assertThat(exception)
-                .describedAs("expected JobNotAbortableException for status $status")
-                .isInstanceOf(JobNotAbortableException::class.java)
+                assertThat(exception)
+                    .describedAs("expected JobNotAbortableException for status $status")
+                    .isInstanceOf(JobNotAbortableException::class.java)
+                assertThat((exception as JobNotAbortableException).status).isEqualTo(status)
+            }
         }
-    }
 
     // --- Helpers ---
 
@@ -111,9 +117,7 @@ class AbortJobUseCaseTest {
             type = "test-type",
             status = status,
             retries = 0,
-            idempotencyKey = UUID.randomUUID().toString(),
             createdAt = Instant.now(),
             updatedAt = Instant.now(),
-            version = 1,
         )
 }

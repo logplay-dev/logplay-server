@@ -51,6 +51,13 @@ class DeregisterWorkerUseCaseTest {
         assertThat(jobGateway.findJobById(job1.id)!!.acquiredByWorkerId).isNull()
         assertThat(jobGateway.findJobById(job2.id)!!.status).isEqualTo(JobStatus.PENDING)
         assertThat(jobGateway.findJobById(job2.id)!!.acquiredByWorkerId).isNull()
+        for (jobId in listOf(job1.id, job2.id)) {
+            val released =
+                jobGateway.eventsForJob(jobId).single { it.eventType == JobEventType.RELEASED }
+            assertThat(released.actorType).isEqualTo(ActorType.SYSTEM)
+            assertThat(released.actorId).isNull()
+            assertThat(released.eventMessage).isEqualTo("released by worker deregistration")
+        }
     }
 
     @Test
@@ -131,10 +138,9 @@ class DeregisterWorkerUseCaseTest {
             type = "test-type",
             status = JobStatus.ACQUIRED,
             retries = 0,
-            idempotencyKey = UUID.randomUUID().toString(),
             createdAt = Instant.now(),
             updatedAt = Instant.now(),
             acquiredByWorkerId = acquiredByWorkerId,
-            version = 1,
+            lastAcquiredAt = Instant.now(),
         )
 }

@@ -8,6 +8,18 @@ import org.zeplinko.logplay.server.core.UUIDv5
  * namespace and a length-prefixed name encoding. Determinism is what makes the primary key alone
  * sufficient for idempotency: two `CreateJob` calls with the same `(groupId, idempotencyKey)`
  * collide on the PK without a separate unique index.
+ *
+ * **This object is part of the storage contract.** The mapping `(groupId, idempotencyKey) → id`
+ * must remain stable across the lifetime of the database. The server does not store the idempotency
+ * key — it only stores the derived `id`. If the algorithm changes:
+ * - Every existing row becomes unaddressable via its original `(groupId, idempotencyKey)` — lookups
+ *   will miss, and the SDK can no longer find jobs it previously created.
+ * - Duplicate detection on create silently breaks: the same `(groupId, idempotencyKey)` will
+ *   produce a different id, bypass the PK collision, and create a second job.
+ *
+ * A known-vector test in `JobIdGeneratorTest` locks the current mapping. Do not change the
+ * namespace, the encoding, or the hash function without first migrating every existing row to its
+ * new id, which has no in-band recovery path.
  */
 object JobIdGenerator {
 

@@ -46,15 +46,8 @@ class InvalidIdempotencyKeyException(message: String) : JobException(message)
 class JobNotFoundException(jobId: String) : JobException("Job not found: $jobId")
 
 /** Operation requires `ACQUIRED` status; the job is in some other state. → 409 */
-class JobNotAcquiredException(jobId: String, status: JobStatus) :
+class JobNotAcquiredException(jobId: String, val status: JobStatus) :
     JobException("Job $jobId is in status $status and is not acquired")
-
-/**
- * Optimistic-locking conflict — another writer mutated the job between read and update. Caller
- * should retry. → 409
- */
-class JobConcurrentModificationException(jobId: String) :
-    JobException("Job $jobId was modified concurrently")
 
 /** No checkpoint exists with the given id (typically used for invalid `after` cursors). → 404 */
 class CheckpointNotFoundException(checkpointId: String) :
@@ -89,7 +82,7 @@ class InvalidJobOutputDataException :
 class InvalidLimitException(max: Int) : JobException("limit must be between 1 and $max")
 
 /** Job is already terminal (`FINISHED`, `FAILED`, `ABORTED`) and cannot be aborted. → 409 */
-class JobNotAbortableException(jobId: String, status: JobStatus) :
+class JobNotAbortableException(jobId: String, val status: JobStatus) :
     JobException("Job $jobId is in status $status and cannot be aborted")
 
 /** Acquired job is owned by a different worker than the one making the request. → 409 */

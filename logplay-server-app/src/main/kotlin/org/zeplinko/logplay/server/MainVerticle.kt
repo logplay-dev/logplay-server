@@ -109,7 +109,6 @@ class MainVerticle(private val jobGateway: JobGateway, private val workerGateway
                 is JobNotAcquiredException,
                 is JobNotAbortableException,
                 is JobNotOwnedByWorkerException,
-                is JobConcurrentModificationException,
                 is InvalidCheckpointOrderException,
                 is WorkerAlreadyRegisteredException -> 409 to failure.message
 

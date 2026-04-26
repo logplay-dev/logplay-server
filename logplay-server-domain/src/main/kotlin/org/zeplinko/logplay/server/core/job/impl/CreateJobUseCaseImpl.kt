@@ -29,8 +29,8 @@ class CreateJobUseCaseImpl(private val jobGateway: JobGateway) : CreateJobUseCas
         if (createJobCommand.maxRetries != null && createJobCommand.maxRetries <= 0)
             throw InvalidMaxRetriesException()
         val currentTime = Instant.now()
-        val job =
-            Job(
+        val newJob =
+            NewJob(
                 id =
                     JobIdGenerator.fromIdempotencyKey(
                         createJobCommand.groupId,
@@ -39,19 +39,14 @@ class CreateJobUseCaseImpl(private val jobGateway: JobGateway) : CreateJobUseCas
                 groupId = createJobCommand.groupId,
                 name = createJobCommand.name.ifBlank { UUID.randomUUID().toString() },
                 type = createJobCommand.type,
-                status = JobStatus.PENDING,
-                retries = 0,
                 maxRetries = createJobCommand.maxRetries,
-                idempotencyKey = createJobCommand.idempotencyKey,
                 inputData = createJobCommand.inputData,
                 createdAt = currentTime,
-                updatedAt = currentTime,
-                version = 1,
             )
         val event =
             JobEvent(
                 id = UUID.randomUUID().toString(),
-                jobId = job.id,
+                jobId = newJob.id,
                 eventType = JobEventType.CREATED,
                 actorType = ActorType.SYSTEM,
                 actorId = null,
@@ -59,6 +54,13 @@ class CreateJobUseCaseImpl(private val jobGateway: JobGateway) : CreateJobUseCas
                 eventMessage = null,
                 eventDetail = null,
             )
-        return jobGateway.insertJobWithEvent(job, event)
+        return when (val result = jobGateway.insertJobWithEvent(newJob, event)) {
+            is InsertJobWithEventResult.Success -> result.job
+            is InsertJobWithEventResult.AlreadyExists ->
+                throw DuplicateIdempotencyKeyException(
+                    createJobCommand.groupId,
+                    createJobCommand.idempotencyKey,
+                )
+        }
     }
 }

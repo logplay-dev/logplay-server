@@ -292,9 +292,7 @@ class AcquirePendingJobsUseCaseTest {
             type = type,
             status = JobStatus.PENDING,
             retries = 0,
-            idempotencyKey = UUID.randomUUID().toString(),
             createdAt = Instant.now(),
             updatedAt = Instant.now(),
-            version = 0,
         )
 }

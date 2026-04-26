@@ -18,6 +18,7 @@ import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.*
 import org.junit.jupiter.api.extension.ExtendWith
 import org.zeplinko.logplay.server.MainVerticle
+import org.zeplinko.logplay.server.core.job.JobIdGenerator
 
 @ExtendWith(VertxExtension::class)
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -55,8 +56,13 @@ abstract class AbstractIntegrationTest {
     fun cleanDb() {
         backend.getJdbcConnection().use { conn ->
             conn.createStatement().use { stmt ->
+                // Delete in dependency order: events/checkpoints reference jobs; job_acquired
+                // references workers; the queue/acquired tables must be empty before workers can
+                // go (workers FK in job_acquired is not ON DELETE CASCADE).
                 stmt.execute("DELETE FROM job_events")
                 stmt.execute("DELETE FROM checkpoints")
+                stmt.execute("DELETE FROM job_acquired")
+                stmt.execute("DELETE FROM job_queue")
                 stmt.execute("DELETE FROM jobs")
                 stmt.execute("DELETE FROM workers")
             }
@@ -81,11 +87,12 @@ abstract class AbstractIntegrationTest {
                 assertThat(body.getString("type")).isEqualTo("render")
                 assertThat(body.getString("status")).isEqualTo("PENDING")
                 assertThat(body.getInteger("retries")).isEqualTo(0)
-                assertThat(body.getLong("version")).isEqualTo(1L)
                 assertThat(body.getString("createdAt")).isNotBlank()
                 assertThat(body.getString("updatedAt")).isNotBlank()
                 assertThat(body.getString("lastAcquiredAt")).isNull()
                 assertThat(body.getString("acquiredByWorkerId")).isNull()
+                assertThat(body.getLong("availableAt")).isEqualTo(0L)
+                assertThat(body.getString("terminalAt")).isNull()
                 assertThat(body.getString("groupId")).isEqualTo("test-group")
                 testContext.completeNow()
             } catch (e: Throwable) {
@@ -324,7 +331,7 @@ abstract class AbstractIntegrationTest {
                 val (job, workerId) = createAndAcquireJob()
                 val completed = completeJob(job.getString("id"), workerId)
                 assertThat(completed.getString("status")).isEqualTo("FINISHED")
-                assertThat(completed.getLong("version")).isGreaterThan(job.getLong("version"))
+                assertThat(completed.getString("terminalAt")).isNotBlank()
                 testContext.completeNow()
             } catch (e: Throwable) {
                 testContext.failNow(e)
@@ -343,7 +350,7 @@ abstract class AbstractIntegrationTest {
                 val released = releaseJob(job.getString("id"), workerId)
                 assertThat(released.getString("status")).isEqualTo("PENDING")
                 assertThat(released.getString("acquiredByWorkerId")).isNull()
-                assertThat(released.getLong("version")).isGreaterThan(job.getLong("version"))
+                assertThat(released.getLong("availableAt")).isEqualTo(0L)
                 testContext.completeNow()
             } catch (e: Throwable) {
                 testContext.failNow(e)
@@ -391,7 +398,7 @@ abstract class AbstractIntegrationTest {
                 assertThat(reacquired).hasSize(1)
                 assertThat(reacquired[0].getString("id")).isEqualTo(jobId)
                 assertThat(reacquired[0].getString("status")).isEqualTo("ACQUIRED")
-                assertThat(reacquired[0].getLong("version")).isGreaterThan(job.getLong("version"))
+                assertThat(reacquired[0].getString("acquiredByWorkerId")).isEqualTo(workerId)
                 testContext.completeNow()
             } catch (e: Throwable) {
                 testContext.failNow(e)
@@ -692,7 +699,8 @@ abstract class AbstractIntegrationTest {
                 val result = reportError(acquired[0].getString("id"), workerId, "error")
 
                 assertThat(result.getString("status")).isEqualTo("FAILED")
-                assertThat(result.getInteger("retries")).isEqualTo(1)
+                // retries is null for terminal jobs; the count lives on the audit events.
+                assertThat(result.getValue("retries")).isNull()
                 testContext.completeNow()
             } catch (e: Throwable) {
                 testContext.failNow(e)
@@ -701,7 +709,7 @@ abstract class AbstractIntegrationTest {
     }
 
     @Test
-    fun `should return 409 when reporting error on non-acquired job`(
+    fun `should return 409 with PENDING status when reporting error on non-acquired job`(
         vertx: Vertx,
         testContext: VertxTestContext,
     ) {
@@ -715,6 +723,7 @@ abstract class AbstractIntegrationTest {
                         .sendJsonObject(JsonObject().put("workerId", workerId).put("error", "fail"))
                         .coAwait()
                 assertThat(response.statusCode()).isEqualTo(409)
+                assertThat(response.bodyAsJsonObject().getString("error")).contains("PENDING")
                 testContext.completeNow()
             } catch (e: Throwable) {
                 testContext.failNow(e)
@@ -804,14 +813,17 @@ abstract class AbstractIntegrationTest {
     // --- Idempotency ---
 
     @Test
-    fun `should return idempotencyKey in job response`(
+    fun `should derive deterministic job id from idempotencyKey and omit key from response`(
         vertx: Vertx,
         testContext: VertxTestContext,
     ) {
         CoroutineScope(vertx.dispatcher()).launch {
             try {
                 val job = createJob("test", "render", idempotencyKey = "my-key-123")
-                assertThat(job.getString("idempotencyKey")).isEqualTo("my-key-123")
+                // The key is not echoed back; it is only the input used to derive `id`.
+                assertThat(job.containsKey("idempotencyKey")).isFalse()
+                assertThat(job.getString("id"))
+                    .isEqualTo(JobIdGenerator.fromIdempotencyKey("test-group", "my-key-123"))
                 testContext.completeNow()
             } catch (e: Throwable) {
                 testContext.failNow(e)
@@ -1084,7 +1096,8 @@ abstract class AbstractIntegrationTest {
                 assertThat(acquired2[0].getString("id")).isEqualTo(jobId)
                 val afterError2 = reportError(jobId, workerId, "error 2")
                 assertThat(afterError2.getString("status")).isEqualTo("FAILED")
-                assertThat(afterError2.getInteger("retries")).isEqualTo(2)
+                // retries is null for terminal jobs; the count lives on the audit events.
+                assertThat(afterError2.getValue("retries")).isNull()
 
                 testContext.completeNow()
             } catch (e: Throwable) {
@@ -1164,7 +1177,7 @@ abstract class AbstractIntegrationTest {
     }
 
     @Test
-    fun `should return 409 when aborting a finished job`(
+    fun `should return 409 with FINISHED status when aborting a finished job`(
         vertx: Vertx,
         testContext: VertxTestContext,
     ) {
@@ -1179,6 +1192,7 @@ abstract class AbstractIntegrationTest {
                         .send()
                         .coAwait()
                 assertThat(response.statusCode()).isEqualTo(409)
+                assertThat(response.bodyAsJsonObject().getString("error")).contains("FINISHED")
                 testContext.completeNow()
             } catch (e: Throwable) {
                 testContext.failNow(e)
@@ -1187,7 +1201,7 @@ abstract class AbstractIntegrationTest {
     }
 
     @Test
-    fun `should return 409 when aborting an already aborted job`(
+    fun `should return 409 with ABORTED status when aborting an already aborted job`(
         vertx: Vertx,
         testContext: VertxTestContext,
     ) {
@@ -1202,6 +1216,7 @@ abstract class AbstractIntegrationTest {
                         .send()
                         .coAwait()
                 assertThat(response.statusCode()).isEqualTo(409)
+                assertThat(response.bodyAsJsonObject().getString("error")).contains("ABORTED")
                 testContext.completeNow()
             } catch (e: Throwable) {
                 testContext.failNow(e)
@@ -2094,7 +2109,7 @@ abstract class AbstractIntegrationTest {
     // --- Conflict (409) ---
 
     @Test
-    fun `should return 409 when completing a pending job`(
+    fun `should return 409 with PENDING status when completing a pending job`(
         vertx: Vertx,
         testContext: VertxTestContext,
     ) {
@@ -2108,6 +2123,7 @@ abstract class AbstractIntegrationTest {
                         .sendJsonObject(JsonObject().put("workerId", workerId))
                         .coAwait()
                 assertThat(response.statusCode()).isEqualTo(409)
+                assertThat(response.bodyAsJsonObject().getString("error")).contains("PENDING")
                 testContext.completeNow()
             } catch (e: Throwable) {
                 testContext.failNow(e)
@@ -2116,7 +2132,7 @@ abstract class AbstractIntegrationTest {
     }
 
     @Test
-    fun `should return 409 when releasing a pending job`(
+    fun `should return 409 with PENDING status when releasing a pending job`(
         vertx: Vertx,
         testContext: VertxTestContext,
     ) {
@@ -2130,6 +2146,7 @@ abstract class AbstractIntegrationTest {
                         .sendJsonObject(JsonObject().put("workerId", workerId))
                         .coAwait()
                 assertThat(response.statusCode()).isEqualTo(409)
+                assertThat(response.bodyAsJsonObject().getString("error")).contains("PENDING")
                 testContext.completeNow()
             } catch (e: Throwable) {
                 testContext.failNow(e)
@@ -2138,7 +2155,7 @@ abstract class AbstractIntegrationTest {
     }
 
     @Test
-    fun `should return 409 when saving checkpoint on a pending job`(
+    fun `should return 409 with PENDING status when saving checkpoint on a pending job`(
         vertx: Vertx,
         testContext: VertxTestContext,
     ) {
@@ -2163,6 +2180,7 @@ abstract class AbstractIntegrationTest {
                         )
                         .coAwait()
                 assertThat(response.statusCode()).isEqualTo(409)
+                assertThat(response.bodyAsJsonObject().getString("error")).contains("PENDING")
                 testContext.completeNow()
             } catch (e: Throwable) {
                 testContext.failNow(e)
@@ -2171,7 +2189,7 @@ abstract class AbstractIntegrationTest {
     }
 
     @Test
-    fun `should return 409 when completing an already finished job`(
+    fun `should return 409 with FINISHED status when completing an already finished job`(
         vertx: Vertx,
         testContext: VertxTestContext,
     ) {
@@ -2186,6 +2204,549 @@ abstract class AbstractIntegrationTest {
                         .sendJsonObject(JsonObject().put("workerId", workerId))
                         .coAwait()
                 assertThat(response.statusCode()).isEqualTo(409)
+                assertThat(response.bodyAsJsonObject().getString("error")).contains("FINISHED")
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    // --- Three-table invariant + sleep semantics ---
+
+    /**
+     * Reads the underlying state-machine tables for a job and asserts the three-table invariant:
+     * the job lives in *exactly one* of `job_queue`, `job_acquired`, or has `jobs.terminal_status`
+     * set. Any other shape (zero locations, or two locations) is a bug.
+     */
+    private fun assertThreeTableInvariant(jobId: String) {
+        backend.getJdbcConnection().use { conn ->
+            val inQueue =
+                conn.prepareStatement("SELECT COUNT(*) FROM job_queue WHERE job_id = ?").use { s ->
+                    s.setString(1, jobId)
+                    s.executeQuery().use {
+                        it.next()
+                        it.getInt(1)
+                    }
+                }
+            val inAcquired =
+                conn.prepareStatement("SELECT COUNT(*) FROM job_acquired WHERE job_id = ?").use { s
+                    ->
+                    s.setString(1, jobId)
+                    s.executeQuery().use {
+                        it.next()
+                        it.getInt(1)
+                    }
+                }
+            val terminalStatus =
+                conn.prepareStatement("SELECT terminal_status FROM jobs WHERE id = ?").use { s ->
+                    s.setString(1, jobId)
+                    s.executeQuery().use { if (it.next()) it.getString(1) else null }
+                }
+            val locations = inQueue + inAcquired + (if (terminalStatus != null) 1 else 0)
+            assertThat(locations)
+                .describedAs(
+                    "three-table invariant violated for job $jobId: queue=$inQueue acquired=$inAcquired terminal=$terminalStatus"
+                )
+                .isEqualTo(1)
+        }
+    }
+
+    private fun readQueueAvailableAt(jobId: String): Long? =
+        backend.getJdbcConnection().use { conn ->
+            conn.prepareStatement("SELECT available_at FROM job_queue WHERE job_id = ?").use { s ->
+                s.setString(1, jobId)
+                s.executeQuery().use { if (it.next()) it.getLong(1) else null }
+            }
+        }
+
+    private fun assertTerminalConsistency(jobId: String) {
+        backend.getJdbcConnection().use { conn ->
+            conn
+                .prepareStatement("SELECT terminal_status, terminal_at FROM jobs WHERE id = ?")
+                .use { s ->
+                    s.setString(1, jobId)
+                    s.executeQuery().use { rs ->
+                        assertThat(rs.next()).describedAs("job $jobId should exist").isTrue()
+                        val terminalStatus = rs.getString("terminal_status")
+                        val terminalAtRaw = rs.getObject("terminal_at")
+                        assertThat(terminalStatus == null)
+                            .describedAs(
+                                "terminal_status / terminal_at consistency violated for job $jobId: terminal_status=$terminalStatus, terminal_at=$terminalAtRaw"
+                            )
+                            .isEqualTo(terminalAtRaw == null)
+                    }
+                }
+        }
+    }
+
+    @Test
+    fun `should maintain three-table invariant across full lifecycle`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val workerId = registerWorker()
+                val created = createJob("inv-job", "render")
+                val jobId = created.getString("id")
+                assertThreeTableInvariant(jobId)
+
+                val acquired = acquireJobs(workerId, 1)
+                assertThat(acquired).hasSize(1)
+                assertThreeTableInvariant(jobId)
+
+                releaseJob(jobId, workerId)
+                assertThreeTableInvariant(jobId)
+
+                acquireJobs(workerId, 1)
+                assertThreeTableInvariant(jobId)
+
+                completeJob(jobId, workerId)
+                assertThreeTableInvariant(jobId)
+
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `should maintain three-table invariant across every transition`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val workerId = registerWorker()
+
+                // PENDING -> ACQUIRED -> PENDING (release) -> ACQUIRED -> FINISHED.
+                val completeFlow = createJob("inv-complete-flow", "render")
+                val completeId = completeFlow.getString("id")
+                assertThreeTableInvariant(completeId)
+                acquireJobs(workerId, 1)
+                assertThreeTableInvariant(completeId)
+                releaseJob(completeId, workerId)
+                assertThreeTableInvariant(completeId)
+                acquireJobs(workerId, 1)
+                assertThreeTableInvariant(completeId)
+                completeJob(completeId, workerId)
+                assertThreeTableInvariant(completeId)
+
+                // PENDING -> ABORTED (pending path).
+                val abortPending = createJob("inv-abort-pending", "render")
+                val abortPendingId = abortPending.getString("id")
+                abortJob(abortPendingId)
+                assertThreeTableInvariant(abortPendingId)
+
+                // PENDING -> ACQUIRED -> ABORTED (acquired path).
+                val abortAcquired = createJob("inv-abort-acquired", "render")
+                val abortAcquiredId = abortAcquired.getString("id")
+                acquireJobs(workerId, 1)
+                abortJob(abortAcquiredId)
+                assertThreeTableInvariant(abortAcquiredId)
+
+                // PENDING -> ACQUIRED -> FAILED (retries exhausted).
+                val failFlow = createJob("inv-fail-flow", "render", maxRetries = 1)
+                val failId = failFlow.getString("id")
+                acquireJobs(workerId, 1)
+                reportError(failId, workerId, "boom")
+                assertThreeTableInvariant(failId)
+
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `should keep terminal_status and terminal_at consistent across every transition`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val workerId = registerWorker()
+
+                // PENDING -> ACQUIRED -> PENDING (release) -> ACQUIRED -> FINISHED.
+                val completeFlow = createJob("complete-flow", "render")
+                val completeId = completeFlow.getString("id")
+                assertTerminalConsistency(completeId)
+                acquireJobs(workerId, 1)
+                assertTerminalConsistency(completeId)
+                releaseJob(completeId, workerId)
+                assertTerminalConsistency(completeId)
+                acquireJobs(workerId, 1)
+                assertTerminalConsistency(completeId)
+                completeJob(completeId, workerId)
+                assertTerminalConsistency(completeId)
+
+                // PENDING -> ABORTED (pending path).
+                val abortPending = createJob("abort-pending", "render")
+                val abortPendingId = abortPending.getString("id")
+                abortJob(abortPendingId)
+                assertTerminalConsistency(abortPendingId)
+
+                // PENDING -> ACQUIRED -> ABORTED (acquired path).
+                val abortAcquired = createJob("abort-acquired", "render")
+                val abortAcquiredId = abortAcquired.getString("id")
+                acquireJobs(workerId, 1)
+                abortJob(abortAcquiredId)
+                assertTerminalConsistency(abortAcquiredId)
+
+                // PENDING -> ACQUIRED -> FAILED (retries exhausted).
+                val failFlow = createJob("fail-flow", "render", maxRetries = 1)
+                val failId = failFlow.getString("id")
+                acquireJobs(workerId, 1)
+                reportError(failId, workerId, "boom")
+                assertTerminalConsistency(failId)
+
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `acquire should skip rows whose availableAt is in the future`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val (job, workerId) = createAndAcquireJob()
+                val jobId = job.getString("id")
+                val futureDeadline = System.currentTimeMillis() + 60_000L
+
+                val released = releaseJob(jobId, workerId, availableAt = futureDeadline)
+                assertThat(released.getString("status")).isEqualTo("PENDING")
+                assertThat(released.getLong("availableAt")).isEqualTo(futureDeadline)
+                assertThat(readQueueAvailableAt(jobId)).isEqualTo(futureDeadline)
+
+                val tooEarly = acquireJobs(workerId, 10)
+                assertThat(tooEarly).isEmpty()
+
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `acquire should pick up rows once availableAt has elapsed`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val (job, workerId) = createAndAcquireJob()
+                val jobId = job.getString("id")
+                // availableAt in the past — should be acquirable immediately.
+                val pastDeadline = System.currentTimeMillis() - 1_000L
+                releaseJob(jobId, workerId, availableAt = pastDeadline)
+
+                val reacquired = acquireJobs(workerId, 10)
+                assertThat(reacquired.map { it.getString("id") }).contains(jobId)
+                assertThreeTableInvariant(jobId)
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `release should emit eventDetail with availableAt when nonzero`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val (job, workerId) = createAndAcquireJob()
+                val jobId = job.getString("id")
+                val deadline = System.currentTimeMillis() + 60_000L
+
+                releaseJob(jobId, workerId, availableAt = deadline)
+
+                val eventsResponse =
+                    client.get(port, "localhost", "/api/v1/jobs/$jobId/events").send().coAwait()
+                val events = eventsResponse.bodyAsJsonArray().map { it as JsonObject }
+                val released =
+                    events.firstOrNull { it.getString("eventType") == "RELEASED" }
+                        ?: error("RELEASED event missing")
+                val detail = released.getString("eventDetail")
+                assertThat(detail).contains("\"availableAt\":$deadline")
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `release should not emit eventDetail when availableAt is zero or absent`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val (job, workerId) = createAndAcquireJob()
+                val jobId = job.getString("id")
+
+                releaseJob(jobId, workerId)
+
+                val eventsResponse =
+                    client.get(port, "localhost", "/api/v1/jobs/$jobId/events").send().coAwait()
+                val events = eventsResponse.bodyAsJsonArray().map { it as JsonObject }
+                val released =
+                    events.firstOrNull { it.getString("eventType") == "RELEASED" }
+                        ?: error("RELEASED event missing")
+                assertThat(released.getString("eventDetail")).isNull()
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `release after worker has lost ownership should return 409 JobNotOwnedByWorkerException`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val (job, workerId) = createAndAcquireJob()
+                val jobId = job.getString("id")
+                releaseJob(jobId, workerId)
+                // Second release: worker no longer owns the row.
+                val response =
+                    client
+                        .post(port, "localhost", "/api/v1/jobs/$jobId/release")
+                        .sendJsonObject(JsonObject().put("workerId", workerId))
+                        .coAwait()
+                assertThat(response.statusCode()).isEqualTo(409)
+                assertThreeTableInvariant(jobId)
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `condemned-worker reaper writes availableAt = 0 unconditionally`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val (job, workerId) = createAndAcquireJob()
+                val jobId = job.getString("id")
+                // Deregister the worker: equivalent to the condemned-worker reaper move-back.
+                val deregister =
+                    client.delete(port, "localhost", "/api/v1/workers/$workerId").send().coAwait()
+                assertThat(deregister.statusCode()).isEqualTo(204)
+                assertThreeTableInvariant(jobId)
+                assertThat(readQueueAvailableAt(jobId)).isEqualTo(0L)
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    // --- Race tests ---
+
+    @Test
+    fun `concurrent acquire and release race results in exactly one move`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val (job, workerA) = createAndAcquireJob()
+                val workerB = registerWorker()
+                val jobId = job.getString("id")
+
+                // Worker A releases concurrently with a re-acquire by anyone.
+                val results =
+                    listOf(
+                            async {
+                                runCatching {
+                                        client
+                                            .post(port, "localhost", "/api/v1/jobs/$jobId/release")
+                                            .sendJsonObject(JsonObject().put("workerId", workerA))
+                                            .coAwait()
+                                            .statusCode()
+                                    }
+                                    .getOrElse { -1 }
+                            },
+                            async { runCatching { acquireJobs(workerB, 1).size }.getOrElse { -1 } },
+                        )
+                        .awaitAll()
+                // Whatever the interleaving, the invariant must hold afterwards.
+                assertThreeTableInvariant(jobId)
+                assertThat(results[0]).isEqualTo(200) // release succeeds — A had ownership
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `concurrent reaper and release race never produces dual state`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val (job, workerId) = createAndAcquireJob()
+                val jobId = job.getString("id")
+                listOf(
+                        async {
+                            client
+                                .delete(port, "localhost", "/api/v1/workers/$workerId")
+                                .send()
+                                .coAwait()
+                                .statusCode()
+                        },
+                        async {
+                            client
+                                .post(port, "localhost", "/api/v1/jobs/$jobId/release")
+                                .sendJsonObject(JsonObject().put("workerId", workerId))
+                                .coAwait()
+                                .statusCode()
+                        },
+                    )
+                    .awaitAll()
+                assertThreeTableInvariant(jobId)
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `concurrent abort and acquire race never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val workerId = registerWorker()
+                val created = createJob("race-job", "render")
+                val jobId = created.getString("id")
+                val results =
+                    listOf(
+                            async {
+                                client
+                                    .post(port, "localhost", "/api/v1/jobs/$jobId/abort")
+                                    .send()
+                                    .coAwait()
+                                    .statusCode()
+                            },
+                            async {
+                                runCatching { acquireJobs(workerId, 1).map { it.getString("id") } }
+                                    .getOrElse { emptyList() }
+                            },
+                        )
+                        .awaitAll()
+                assertThreeTableInvariant(jobId)
+                // At least one of the two operations must have observed the job.
+                @Suppress("UNCHECKED_CAST") val acquiredIds = results[1] as List<String>
+                val aborted = results[0] == 200
+                assertThat(aborted || acquiredIds.contains(jobId))
+                    .describedAs("neither abort nor acquire saw the job")
+                    .isTrue()
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `concurrent abort and release race never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val (job, workerId) = createAndAcquireJob()
+                val jobId = job.getString("id")
+                listOf(
+                        async {
+                            client
+                                .post(port, "localhost", "/api/v1/jobs/$jobId/abort")
+                                .send()
+                                .coAwait()
+                                .statusCode()
+                        },
+                        async {
+                            client
+                                .post(port, "localhost", "/api/v1/jobs/$jobId/release")
+                                .sendJsonObject(JsonObject().put("workerId", workerId))
+                                .coAwait()
+                                .statusCode()
+                        },
+                    )
+                    .awaitAll()
+                assertThreeTableInvariant(jobId)
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `concurrent abort and complete race never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val (job, workerId) = createAndAcquireJob()
+                val jobId = job.getString("id")
+                listOf(
+                        async {
+                            client
+                                .post(port, "localhost", "/api/v1/jobs/$jobId/abort")
+                                .send()
+                                .coAwait()
+                                .statusCode()
+                        },
+                        async {
+                            client
+                                .post(port, "localhost", "/api/v1/jobs/$jobId/complete")
+                                .sendJsonObject(JsonObject().put("workerId", workerId))
+                                .coAwait()
+                                .statusCode()
+                        },
+                    )
+                    .awaitAll()
+                assertThreeTableInvariant(jobId)
+                // After both, terminal_status is set to one of FINISHED or ABORTED.
+                backend.getJdbcConnection().use { conn ->
+                    val terminal =
+                        conn
+                            .prepareStatement("SELECT terminal_status FROM jobs WHERE id = ?")
+                            .use { s ->
+                                s.setString(1, jobId)
+                                s.executeQuery().use {
+                                    it.next()
+                                    it.getString(1)
+                                }
+                            }
+                    assertThat(terminal).isIn("FINISHED", "ABORTED")
+                }
                 testContext.completeNow()
             } catch (e: Throwable) {
                 testContext.failNow(e)
@@ -2228,7 +2789,11 @@ abstract class AbstractIntegrationTest {
         if (inputData != null) body.put("inputData", inputData)
         val response = client.post(port, "localhost", "/api/v1/jobs").sendJsonObject(body).coAwait()
         assertThat(response.statusCode()).isEqualTo(201)
-        return response.bodyAsJsonObject()
+        val json = response.bodyAsJsonObject()
+        val id = json.getString("id")
+        assertTerminalConsistency(id)
+        assertThreeTableInvariant(id)
+        return json
     }
 
     private suspend fun acquireJobs(
@@ -2249,7 +2814,13 @@ abstract class AbstractIntegrationTest {
                 )
                 .coAwait()
         assertThat(response.statusCode()).isEqualTo(200)
-        return response.bodyAsJsonArray().map { it as JsonObject }
+        val jobs = response.bodyAsJsonArray().map { it as JsonObject }
+        jobs.forEach {
+            val id = it.getString("id")
+            assertTerminalConsistency(id)
+            assertThreeTableInvariant(id)
+        }
+        return jobs
     }
 
     private suspend fun saveCheckpoint(
@@ -2270,6 +2841,8 @@ abstract class AbstractIntegrationTest {
                 .sendJsonObject(body)
                 .coAwait()
         assertThat(response.statusCode()).isEqualTo(201)
+        assertTerminalConsistency(jobId)
+        assertThreeTableInvariant(jobId)
         return response.bodyAsJsonObject()
     }
 
@@ -2301,22 +2874,34 @@ abstract class AbstractIntegrationTest {
                 .sendJsonObject(body)
                 .coAwait()
         assertThat(response.statusCode()).isEqualTo(200)
+        assertTerminalConsistency(jobId)
+        assertThreeTableInvariant(jobId)
         return response.bodyAsJsonObject()
     }
 
-    private suspend fun releaseJob(jobId: String, workerId: String): JsonObject {
+    private suspend fun releaseJob(
+        jobId: String,
+        workerId: String,
+        availableAt: Long? = null,
+    ): JsonObject {
+        val body = JsonObject().put("workerId", workerId)
+        if (availableAt != null) body.put("availableAt", availableAt)
         val response =
             client
                 .post(port, "localhost", "/api/v1/jobs/$jobId/release")
-                .sendJsonObject(JsonObject().put("workerId", workerId))
+                .sendJsonObject(body)
                 .coAwait()
         assertThat(response.statusCode()).isEqualTo(200)
+        assertTerminalConsistency(jobId)
+        assertThreeTableInvariant(jobId)
         return response.bodyAsJsonObject()
     }
 
     private suspend fun abortJob(jobId: String): JsonObject {
         val response = client.post(port, "localhost", "/api/v1/jobs/$jobId/abort").send().coAwait()
         assertThat(response.statusCode()).isEqualTo(200)
+        assertTerminalConsistency(jobId)
+        assertThreeTableInvariant(jobId)
         return response.bodyAsJsonObject()
     }
 
@@ -2333,6 +2918,8 @@ abstract class AbstractIntegrationTest {
                 .sendJsonObject(body)
                 .coAwait()
         assertThat(response.statusCode()).isEqualTo(200)
+        assertTerminalConsistency(jobId)
+        assertThreeTableInvariant(jobId)
         return response.bodyAsJsonObject()
     }
 

@@ -12,9 +12,11 @@ class ReportExecutionErrorUseCaseImpl(private val jobGateway: JobGateway) :
         if (command.jobId.isBlank()) throw BlankJobIdException()
         if (command.workerId.isBlank()) throw BlankWorkerIdException()
         val now = Instant.now()
-        val updated =
+        val result =
             jobGateway.reportExecutionError(command.jobId, command.workerId, now) { job ->
-                val newRetries = job.retries + 1
+                // job is guaranteed ACQUIRED here (gateway verified ownership) — retries is
+                // populated for ACQUIRED rows from job_acquired.retries.
+                val newRetries = (job.retries ?: 0) + 1
                 val nextStatus =
                     if (job.maxRetries != null && newRetries >= job.maxRetries) JobStatus.FAILED
                     else JobStatus.PENDING
@@ -48,12 +50,13 @@ class ReportExecutionErrorUseCaseImpl(private val jobGateway: JobGateway) :
                     }
                 ExecutionErrorResult(status = nextStatus, retries = newRetries, events = events)
             }
-        if (updated != null) return updated
-        val job = jobGateway.findJobById(command.jobId) ?: throw JobNotFoundException(command.jobId)
-        if (job.status != JobStatus.ACQUIRED)
-            throw JobNotAcquiredException(command.jobId, job.status)
-        if (job.acquiredByWorkerId != command.workerId)
-            throw JobNotOwnedByWorkerException(command.jobId, command.workerId)
-        throw JobConcurrentModificationException(command.jobId)
+        return when (result) {
+            is ReportExecutionErrorResult.Success -> result.job
+            is ReportExecutionErrorResult.NotFound -> throw JobNotFoundException(command.jobId)
+            is ReportExecutionErrorResult.WrongStatus ->
+                throw JobNotAcquiredException(command.jobId, result.status)
+            is ReportExecutionErrorResult.WrongWorker ->
+                throw JobNotOwnedByWorkerException(command.jobId, command.workerId)
+        }
     }
 }

@@ -28,6 +28,9 @@ fun main() {
         .migrate()
 
     val vertx = Vertx.vertx()
+    // Pool/driver tuning is hardcoded for now. When server configuration is standardised
+    // (env vars / config file), these knobs should be exposed there with the values below
+    // as defaults.
     val connectOptions =
         PgConnectOptions()
             .setHost(dbHost)
@@ -35,9 +38,12 @@ fun main() {
             .setDatabase(dbName)
             .setUser(dbUser)
             .setPassword(dbPassword)
+            .setCachePreparedStatements(true)
+            .setPreparedStatementCacheMaxSize(256)
+            .setPipeliningLimit(256)
     val pool =
         PgBuilder.pool()
-            .with(PoolOptions().setMaxSize(10))
+            .with(PoolOptions().setMaxSize(32))
             .connectingTo(connectOptions)
             .using(vertx)
             .build()

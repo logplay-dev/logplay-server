@@ -85,6 +85,12 @@ class CleanupDeadWorkersUseCaseTest {
         assertThat(workerGateway.findWorkerById("worker-1")).isNull()
         assertThat(jobGateway.findJobById(job.id)!!.status).isEqualTo(JobStatus.PENDING)
         assertThat(jobGateway.findJobById(job.id)!!.acquiredByWorkerId).isNull()
+        val released =
+            jobGateway.eventsForJob(job.id).single { it.eventType == JobEventType.RELEASED }
+        assertThat(released.actorType).isEqualTo(ActorType.SYSTEM)
+        assertThat(released.actorId).isNull()
+        assertThat(released.eventMessage)
+            .isEqualTo("released by dead-worker cleanup after condemn period elapsed")
     }
 
     @Test
@@ -201,10 +207,9 @@ class CleanupDeadWorkersUseCaseTest {
             type = "test-type",
             status = JobStatus.ACQUIRED,
             retries = 0,
-            idempotencyKey = UUID.randomUUID().toString(),
             createdAt = Instant.now(),
             updatedAt = Instant.now(),
             acquiredByWorkerId = acquiredByWorkerId,
-            version = 1,
+            lastAcquiredAt = Instant.now(),
         )
 }

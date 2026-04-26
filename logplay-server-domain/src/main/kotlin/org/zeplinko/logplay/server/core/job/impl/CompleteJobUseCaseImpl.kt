@@ -21,14 +21,22 @@ class CompleteJobUseCaseImpl(private val jobGateway: JobGateway) : CompleteJobUs
                 eventMessage = null,
                 eventDetail = null,
             )
-        val completed =
-            jobGateway.completeJob(command.jobId, command.workerId, command.outputData, now, event)
-        if (completed != null) return completed
-        val job = jobGateway.findJobById(command.jobId) ?: throw JobNotFoundException(command.jobId)
-        if (job.status != JobStatus.ACQUIRED)
-            throw JobNotAcquiredException(command.jobId, job.status)
-        if (job.acquiredByWorkerId != command.workerId)
-            throw JobNotOwnedByWorkerException(command.jobId, command.workerId)
-        throw JobConcurrentModificationException(command.jobId)
+        return when (
+            val result =
+                jobGateway.completeJob(
+                    command.jobId,
+                    command.workerId,
+                    command.outputData,
+                    now,
+                    event,
+                )
+        ) {
+            is CompleteJobResult.Success -> result.job
+            is CompleteJobResult.NotFound -> throw JobNotFoundException(command.jobId)
+            is CompleteJobResult.WrongStatus ->
+                throw JobNotAcquiredException(command.jobId, result.status)
+            is CompleteJobResult.WrongWorker ->
+                throw JobNotOwnedByWorkerException(command.jobId, command.workerId)
+        }
     }
 }

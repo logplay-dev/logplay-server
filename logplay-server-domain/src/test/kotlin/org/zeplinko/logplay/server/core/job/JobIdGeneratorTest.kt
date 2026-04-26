@@ -65,4 +65,22 @@ class JobIdGeneratorTest {
 
         assertThat(ids.toSet()).hasSize(1000)
     }
+
+    /**
+     * Storage-contract lockdown: the mapping `(groupId, idempotencyKey) → id` MUST stay stable
+     * across the lifetime of the database. The server stores only the derived id; the idempotency
+     * key is not stored. Any change to the namespace, encoding, or hash function orphans every
+     * existing row from its logical identity. If you're updating this test, you are almost
+     * certainly introducing a silent data-corruption bug. See [JobIdGenerator] for the full failure
+     * mode.
+     */
+    @Test
+    fun `fromIdempotencyKey produces locked output for fixed inputs (DO NOT UPDATE)`() {
+        assertThat(JobIdGenerator.fromIdempotencyKey("logplay-storage-contract", "vector-1"))
+            .isEqualTo("1694d977-2868-54c2-ba52-5b3f5b2d7a0b")
+        assertThat(JobIdGenerator.fromIdempotencyKey("", ""))
+            .isEqualTo("75a838af-9b02-5880-b440-0b526be1c4be")
+        assertThat(JobIdGenerator.fromIdempotencyKey("group-A", "order-123"))
+            .isEqualTo("323d8d5f-c875-5251-aa5e-5d7e3fe01912")
+    }
 }
