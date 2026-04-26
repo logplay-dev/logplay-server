@@ -192,6 +192,132 @@ abstract class AbstractIntegrationTest {
     }
 
     @Test
+    fun `should save a checkpoint when data field is omitted from request body`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val (job, workerId) = createAndAcquireJob()
+                val checkpoint = saveCheckpoint(job.getString("id"), workerId, includeData = false)
+                assertThat(checkpoint.getString("data")).isNull()
+                assertThat(checkpoint.getString("id")).isNotBlank()
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `should save a checkpoint when data is explicitly null in request body`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val (job, workerId) = createAndAcquireJob()
+                val checkpoint = saveCheckpoint(job.getString("id"), workerId, data = null)
+                assertThat(checkpoint.getString("data")).isNull()
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `should save a checkpoint with empty base64 data and round-trip as empty string`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val (job, workerId) = createAndAcquireJob()
+                val checkpoint = saveCheckpoint(job.getString("id"), workerId, data = "")
+                assertThat(checkpoint.getString("data")).isEqualTo("")
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `should round-trip a mixed chain of null and non-null data through pagination`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val (job, workerId) = createAndAcquireJob()
+                val jobId = job.getString("id")
+                val payload = Base64.getEncoder().encodeToString("payload".toByteArray())
+
+                val c1 = saveCheckpoint(jobId, workerId, previousCheckpointId = null, data = null)
+                val c2 =
+                    saveCheckpoint(
+                        jobId,
+                        workerId,
+                        previousCheckpointId = c1.getString("id"),
+                        data = payload,
+                    )
+                val c3 =
+                    saveCheckpoint(
+                        jobId,
+                        workerId,
+                        previousCheckpointId = c2.getString("id"),
+                        includeData = false,
+                    )
+
+                val page = getCheckpoints(jobId)
+                val checkpoints = page.getJsonArray("checkpoints")
+                assertThat(checkpoints).hasSize(3)
+                assertThat(checkpoints.getJsonObject(0).getString("id"))
+                    .isEqualTo(c1.getString("id"))
+                assertThat(checkpoints.getJsonObject(0).getString("data")).isNull()
+                assertThat(checkpoints.getJsonObject(1).getString("id"))
+                    .isEqualTo(c2.getString("id"))
+                assertThat(checkpoints.getJsonObject(1).getString("data")).isEqualTo(payload)
+                assertThat(checkpoints.getJsonObject(2).getString("id"))
+                    .isEqualTo(c3.getString("id"))
+                assertThat(checkpoints.getJsonObject(2).getString("data")).isNull()
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `should reset retries when saving a checkpoint with null data`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val workerId = registerWorker()
+                createJob(idempotencyKey = "retry-null-cp", maxRetries = 5)
+                var job = acquireJobs(workerId, 1).first()
+                val jobId = job.getString("id")
+
+                reportError(jobId, workerId, "boom")
+                job = acquireJobs(workerId, 1).first()
+                assertThat(job.getInteger("retries")).isEqualTo(1)
+
+                saveCheckpoint(jobId, workerId, includeData = false)
+
+                reportError(jobId, workerId, "boom2")
+                job = acquireJobs(workerId, 1).first()
+                assertThat(job.getInteger("retries")).isEqualTo(1)
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
     fun `should complete an acquired job`(vertx: Vertx, testContext: VertxTestContext) {
         CoroutineScope(vertx.dispatcher()).launch {
             try {
@@ -2131,9 +2257,11 @@ abstract class AbstractIntegrationTest {
         workerId: String,
         previousCheckpointId: String? = null,
         name: String? = "test checkpoint",
-        data: String = Base64.getEncoder().encodeToString("test-data".toByteArray()),
+        data: String? = Base64.getEncoder().encodeToString("test-data".toByteArray()),
+        includeData: Boolean = true,
     ): JsonObject {
-        val body = JsonObject().put("workerId", workerId).put("data", data)
+        val body = JsonObject().put("workerId", workerId)
+        if (includeData) body.put("data", data)
         if (previousCheckpointId != null) body.put("previousCheckpointId", previousCheckpointId)
         if (name != null) body.put("name", name)
         val response =

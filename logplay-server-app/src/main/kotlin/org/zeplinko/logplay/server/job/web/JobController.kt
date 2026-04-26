@@ -8,8 +8,27 @@ import org.zeplinko.logplay.server.job.use.case.JobUseCaseLookUp
 import org.zeplinko.logplay.server.web.InvalidQueryParameterException
 import org.zeplinko.logplay.server.web.parseBody
 
+/**
+ * REST handlers for the `/jobs` family of endpoints. Each handler parses the request, dispatches to
+ * the corresponding use case via [JobUseCaseLookUp], and renders the response. Domain exceptions
+ * are not caught here — they bubble to the central error handler in `MainVerticle`, which maps each
+ * to its HTTP status code.
+ */
 class JobController(private val useCases: JobUseCaseLookUp) {
 
+    /**
+     * Mounts every job route on `router` under the supplied [support] coroutine adapter. Endpoints
+     * registered:
+     * - `POST /jobs` — create a job (201)
+     * - `POST /jobs/acquire` — acquire pending jobs (200, possibly empty)
+     * - `GET /jobs/:jobId/checkpoints?after=&limit=` — paginate checkpoints (200)
+     * - `POST /jobs/:jobId/checkpoints` — save a checkpoint (201)
+     * - `POST /jobs/:jobId/complete` — complete the job (200)
+     * - `POST /jobs/:jobId/release` — return the job to PENDING (200)
+     * - `POST /jobs/:jobId/error` — report an execution error (200)
+     * - `POST /jobs/:jobId/abort` — abort the job (200)
+     * - `GET /jobs/:jobId/events` — return the audit timeline (200)
+     */
     fun registerRoutes(router: Router, support: CoroutineRouterSupport): Unit =
         with(support) {
             router.post("/jobs").coHandler(requestHandler = ::createJob)

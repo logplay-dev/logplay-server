@@ -3,6 +3,12 @@ package org.zeplinko.logplay.server.core.job
 import java.util.UUID
 import org.zeplinko.logplay.server.core.UUIDv5
 
+/**
+ * Derives stable job ids from `(groupId, idempotencyKey)` using UUIDv5 (SHA-1) over a fixed LogPlay
+ * namespace and a length-prefixed name encoding. Determinism is what makes the primary key alone
+ * sufficient for idempotency: two `CreateJob` calls with the same `(groupId, idempotencyKey)`
+ * collide on the PK without a separate unique index.
+ */
 object JobIdGenerator {
 
     // DO NOT CHANGE. This namespace is baked into every derived job id.
@@ -12,6 +18,11 @@ object JobIdGenerator {
     private val LOGPLAY_JOB_NAMESPACE: UUID =
         UUID.fromString("a3c6e3f4-9c3e-4e2a-8b7f-1a9d3b8c6e4a")
 
+    /**
+     * Returns the deterministic job id for the given `(groupId, idempotencyKey)`. The same inputs
+     * always produce the same output; different inputs produce different outputs (the
+     * length-prefixed encoding rules out collisions from concatenation ambiguity).
+     */
     fun fromIdempotencyKey(groupId: String, idempotencyKey: String): String {
         val name = UUIDv5.encodeName(groupId, idempotencyKey)
         return UUIDv5.generate(LOGPLAY_JOB_NAMESPACE, name).toString()

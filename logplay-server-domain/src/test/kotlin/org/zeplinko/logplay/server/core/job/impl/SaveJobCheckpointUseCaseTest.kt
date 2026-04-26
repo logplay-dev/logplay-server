@@ -61,6 +61,54 @@ class SaveJobCheckpointUseCaseTest {
     }
 
     @Test
+    fun `execute should accept null data and persist it as null`() = runTest {
+        val job = aJob(status = JobStatus.ACQUIRED, acquiredByWorkerId = workerId)
+        gateway.save(job)
+
+        val checkpoint =
+            useCase.execute(SaveJobCheckpointCommand(job.id, workerId, null, "marker", null))
+
+        assertThat(checkpoint.data).isNull()
+        assertThat(checkpoint.name).isEqualTo("marker")
+        assertThat(gateway.checkpointsForJob(job.id))
+            .singleElement()
+            .satisfies({ assertThat(it.data).isNull() })
+    }
+
+    @Test
+    fun `execute should preserve empty byte array distinctly from null`() = runTest {
+        val job = aJob(status = JobStatus.ACQUIRED, acquiredByWorkerId = workerId)
+        gateway.save(job)
+
+        val checkpoint =
+            useCase.execute(SaveJobCheckpointCommand(job.id, workerId, null, null, byteArrayOf()))
+
+        assertThat(checkpoint.data).isNotNull()
+        assertThat(checkpoint.data).isEmpty()
+    }
+
+    @Test
+    fun `execute should support a mixed chain of null and non-null data checkpoints`() = runTest {
+        val job = aJob(status = JobStatus.ACQUIRED, acquiredByWorkerId = workerId)
+        gateway.save(job)
+
+        val first = useCase.execute(SaveJobCheckpointCommand(job.id, workerId, null, "a", null))
+        val second =
+            useCase.execute(
+                SaveJobCheckpointCommand(job.id, workerId, first.id, "b", "payload".toByteArray())
+            )
+        val third =
+            useCase.execute(SaveJobCheckpointCommand(job.id, workerId, second.id, "c", null))
+
+        assertThat(first.data).isNull()
+        assertThat(second.data).isEqualTo("payload".toByteArray())
+        assertThat(third.data).isNull()
+        assertThat(first.orderKey).isEqualTo(1)
+        assertThat(second.orderKey).isEqualTo(2)
+        assertThat(third.orderKey).isEqualTo(3)
+    }
+
+    @Test
     fun `execute should generate deterministic ids from chain position`() = runTest {
         val job = aJob(status = JobStatus.ACQUIRED, acquiredByWorkerId = workerId)
         gateway.save(job)
