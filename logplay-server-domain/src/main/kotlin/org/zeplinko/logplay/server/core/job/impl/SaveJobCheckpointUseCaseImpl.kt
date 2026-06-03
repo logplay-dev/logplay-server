@@ -13,8 +13,8 @@ class SaveJobCheckpointUseCaseImpl(private val jobGateway: JobGateway) : SaveJob
     override suspend fun execute(command: SaveJobCheckpointCommand): Checkpoint {
         validate(command)
         val now = Instant.now()
-        val saved =
-            jobGateway.saveCheckpoint(command.jobId, command.workerId, now) { _, lastCheckpoint ->
+        val result =
+            jobGateway.saveCheckpoint(command.jobId, command.workerId, now) { lastCheckpoint ->
                 if (lastCheckpoint?.id != command.previousCheckpointId)
                     throw InvalidCheckpointOrderException(command.jobId)
                 Checkpoint(
@@ -31,13 +31,14 @@ class SaveJobCheckpointUseCaseImpl(private val jobGateway: JobGateway) : SaveJob
                     data = command.data,
                 )
             }
-        if (saved != null) return saved
-        val job = jobGateway.findJobById(command.jobId) ?: throw JobNotFoundException(command.jobId)
-        if (job.status != JobStatus.ACQUIRED)
-            throw JobNotAcquiredException(command.jobId, job.status)
-        if (job.acquiredByWorkerId != command.workerId)
-            throw JobNotOwnedByWorkerException(command.jobId, command.workerId)
-        throw JobConcurrentModificationException(command.jobId)
+        return when (result) {
+            is SaveCheckpointResult.Success -> result.checkpoint
+            is SaveCheckpointResult.NotFound -> throw JobNotFoundException(command.jobId)
+            is SaveCheckpointResult.WrongStatus ->
+                throw JobNotAcquiredException(command.jobId, result.status)
+            is SaveCheckpointResult.WrongWorker ->
+                throw JobNotOwnedByWorkerException(command.jobId, command.workerId)
+        }
     }
 
     private fun validate(command: SaveJobCheckpointCommand) {

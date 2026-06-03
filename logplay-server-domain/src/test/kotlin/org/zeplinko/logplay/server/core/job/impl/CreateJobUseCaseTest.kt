@@ -22,10 +22,10 @@ class CreateJobUseCaseTest {
     // --- Happy path ---
 
     @Test
-    fun `execute should create job with idempotencyKey`() = runTest {
-        val job = useCase.execute(aCommand(idempotencyKey = "my-key"))
+    fun `execute should derive the same id when given the same idempotencyKey`() = runTest {
+        val job = useCase.execute(aCommand(groupId = "g", idempotencyKey = "my-key"))
 
-        assertThat(job.idempotencyKey).isEqualTo("my-key")
+        assertThat(job.id).isEqualTo(JobIdGenerator.fromIdempotencyKey("g", "my-key"))
     }
 
     @Test
@@ -58,10 +58,10 @@ class CreateJobUseCaseTest {
 
     @Test
     fun `execute should allow different idempotency keys`() = runTest {
-        useCase.execute(aCommand(idempotencyKey = "key-1"))
+        val job1 = useCase.execute(aCommand(idempotencyKey = "key-1"))
         val job2 = useCase.execute(aCommand(idempotencyKey = "key-2"))
 
-        assertThat(job2.idempotencyKey).isEqualTo("key-2")
+        assertThat(job2.id).isNotEqualTo(job1.id)
     }
 
     @Test
@@ -69,7 +69,6 @@ class CreateJobUseCaseTest {
         val job1 = useCase.execute(aCommand(groupId = "A", idempotencyKey = "K"))
         val job2 = useCase.execute(aCommand(groupId = "B", idempotencyKey = "K"))
 
-        assertThat(job2.idempotencyKey).isEqualTo("K")
         assertThat(job2.groupId).isEqualTo("B")
         // Derived ids must differ when groupId differs even for the same key.
         assertThat(job1.id).isNotEqualTo(job2.id)
@@ -106,9 +105,9 @@ class CreateJobUseCaseTest {
     @Test
     fun `execute should accept idempotency key with exactly 64 characters`() = runTest {
         val exactKey = "a".repeat(64)
-        val job = useCase.execute(aCommand(idempotencyKey = exactKey))
+        val job = useCase.execute(aCommand(groupId = "g", idempotencyKey = exactKey))
 
-        assertThat(job.idempotencyKey).isEqualTo(exactKey)
+        assertThat(job.id).isEqualTo(JobIdGenerator.fromIdempotencyKey("g", exactKey))
     }
 
     // --- Group ID validation ---

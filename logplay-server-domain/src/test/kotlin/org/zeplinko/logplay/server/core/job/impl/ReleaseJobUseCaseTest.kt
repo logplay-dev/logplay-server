@@ -99,7 +99,7 @@ class ReleaseJobUseCaseTest {
     }
 
     @Test
-    fun `execute should throw JobNotAcquiredException for all non-ACQUIRED statuses`() = runTest {
+    fun `execute should throw JobNotAcquiredException carrying the actual status`() = runTest {
         for (status in
             listOf(JobStatus.PENDING, JobStatus.FINISHED, JobStatus.FAILED, JobStatus.ABORTED)) {
             val localGateway = InMemoryJobGateway()
@@ -116,6 +116,7 @@ class ReleaseJobUseCaseTest {
             assertThat(exception)
                 .describedAs("expected JobNotAcquiredException for status $status")
                 .isInstanceOf(JobNotAcquiredException::class.java)
+            assertThat((exception as JobNotAcquiredException).status).isEqualTo(status)
         }
     }
 
@@ -136,18 +137,22 @@ class ReleaseJobUseCaseTest {
 
     // --- Helpers ---
 
-    private fun aJob(status: JobStatus, acquiredByWorkerId: String? = null) =
-        Job(
+    private fun aJob(status: JobStatus, acquiredByWorkerId: String? = null): Job {
+        // Truncate to ms so the fixture mirrors what a DB-backed Job carries; assertions on
+        // updatedAt ordering would otherwise race the use case's own Instant.now() within the
+        // same millisecond (sub-ms nanos make the derived ms value look "earlier").
+        val now = Instant.ofEpochMilli(Instant.now().toEpochMilli())
+        return Job(
             id = UUID.randomUUID().toString(),
             groupId = "test-group",
             name = "test-job",
             type = "test-type",
             status = status,
             retries = 0,
-            idempotencyKey = UUID.randomUUID().toString(),
-            createdAt = Instant.now(),
-            updatedAt = Instant.now(),
+            createdAt = now,
+            updatedAt = now,
             acquiredByWorkerId = acquiredByWorkerId,
-            version = 1,
+            lastAcquiredAt = if (status == JobStatus.ACQUIRED) now else null,
         )
+    }
 }

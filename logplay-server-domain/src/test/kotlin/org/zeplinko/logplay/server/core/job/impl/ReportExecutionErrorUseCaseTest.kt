@@ -76,7 +76,9 @@ class ReportExecutionErrorUseCaseTest {
         val result = useCase.execute(ReportExecutionErrorCommand(job.id, workerId, "error"))
 
         assertThat(result.status).isEqualTo(JobStatus.FAILED)
-        assertThat(result.retries).isEqualTo(3)
+        // retries is null for terminal jobs; the new count is recorded on the
+        // ERROR_REPORTED event, not on the read-back Job.
+        assertThat(result.retries).isNull()
     }
 
     @Test
@@ -93,7 +95,7 @@ class ReportExecutionErrorUseCaseTest {
         val result = useCase.execute(ReportExecutionErrorCommand(job.id, workerId, "error"))
 
         assertThat(result.status).isEqualTo(JobStatus.FAILED)
-        assertThat(result.retries).isEqualTo(1)
+        assertThat(result.retries).isNull()
     }
 
     @Test
@@ -215,7 +217,7 @@ class ReportExecutionErrorUseCaseTest {
     }
 
     @Test
-    fun `execute should throw JobNotAcquiredException for all non-ACQUIRED statuses`() = runTest {
+    fun `execute should throw JobNotAcquiredException carrying the actual status`() = runTest {
         for (status in
             listOf(JobStatus.PENDING, JobStatus.FINISHED, JobStatus.FAILED, JobStatus.ABORTED)) {
             val localGateway = InMemoryJobGateway()
@@ -232,6 +234,7 @@ class ReportExecutionErrorUseCaseTest {
             assertThat(exception)
                 .describedAs("expected JobNotAcquiredException for status $status")
                 .isInstanceOf(JobNotAcquiredException::class.java)
+            assertThat((exception as JobNotAcquiredException).status).isEqualTo(status)
         }
     }
 
@@ -274,10 +277,9 @@ class ReportExecutionErrorUseCaseTest {
             status = status,
             retries = retries,
             maxRetries = maxRetries,
-            idempotencyKey = UUID.randomUUID().toString(),
             createdAt = Instant.now(),
             updatedAt = Instant.now(),
             acquiredByWorkerId = acquiredByWorkerId,
-            version = 1,
+            lastAcquiredAt = if (status == JobStatus.ACQUIRED) Instant.now() else null,
         )
 }

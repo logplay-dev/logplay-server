@@ -17,14 +17,14 @@ interface CreateJobUseCase {
 }
 
 /**
- * Atomically transitions up to `limit` `PENDING` jobs matching `(groupId, type)` to `ACQUIRED`,
- * binding them to `workerId`. Uses `SELECT ... FOR UPDATE SKIP LOCKED` so concurrent acquirers
- * never block each other.
+ * Atomically transitions up to `limit` `PENDING` jobs matching `(groupId, type)` whose
+ * `available_at <= now` to `ACQUIRED`, binding them to `workerId`. Uses `SELECT ... FOR UPDATE SKIP
+ * LOCKED` so concurrent acquirers never block each other.
  */
 interface AcquirePendingJobsUseCase {
     /**
-     * @return the acquired jobs in `updated_at ASC` order. Empty list (not an error) if no matching
-     *   pending jobs exist or the worker is unknown/condemned.
+     * @return the acquired jobs in `enqueued_at ASC` order. Empty list (not an error) if no
+     *   matching pending jobs exist or the worker is unknown/condemned.
      * @throws BlankGroupIdException, BlankJobTypeException, BlankWorkerIdException,
      *   InvalidLimitException for input validation failures.
      */
@@ -42,7 +42,6 @@ interface SaveJobCheckpointUseCase {
      *   current tail checkpoint id.
      * @throws JobNotFoundException, JobNotAcquiredException, JobNotOwnedByWorkerException for
      *   ownership/state violations.
-     * @throws JobConcurrentModificationException on optimistic lock conflict.
      */
     suspend fun execute(command: SaveJobCheckpointCommand): Checkpoint
 }
@@ -52,22 +51,17 @@ interface SaveJobCheckpointUseCase {
  * Terminal — the job is no longer mutable.
  */
 interface CompleteJobUseCase {
-    /**
-     * @throws JobNotFoundException, JobNotAcquiredException, JobNotOwnedByWorkerException,
-     *   JobConcurrentModificationException.
-     */
+    /** @throws JobNotFoundException, JobNotAcquiredException, JobNotOwnedByWorkerException. */
     suspend fun execute(command: CompleteJobCommand): Job
 }
 
 /**
  * Returns an `ACQUIRED` job to `PENDING` so another worker can pick it up. Used for graceful
- * shutdown or voluntary handoff. Does not increment `retries`.
+ * shutdown, voluntary handoff, and SDK-driven sleep (when an `availableAt` deadline is supplied).
+ * Does not increment `retries`.
  */
 interface ReleaseJobUseCase {
-    /**
-     * @throws JobNotFoundException, JobNotAcquiredException, JobNotOwnedByWorkerException,
-     *   JobConcurrentModificationException.
-     */
+    /** @throws JobNotFoundException, JobNotAcquiredException, JobNotOwnedByWorkerException. */
     suspend fun execute(command: ReleaseJobCommand): Job
 }
 
@@ -91,10 +85,7 @@ interface GetCheckpointsUseCase {
  * with the state transition.
  */
 interface ReportExecutionErrorUseCase {
-    /**
-     * @throws JobNotFoundException, JobNotAcquiredException, JobNotOwnedByWorkerException,
-     *   JobConcurrentModificationException.
-     */
+    /** @throws JobNotFoundException, JobNotAcquiredException, JobNotOwnedByWorkerException. */
     suspend fun execute(command: ReportExecutionErrorCommand): Job
 }
 

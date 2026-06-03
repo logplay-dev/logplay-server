@@ -244,10 +244,8 @@ class GetCheckpointsUseCaseTest {
             type = "test-type",
             status = status,
             retries = 0,
-            idempotencyKey = UUID.randomUUID().toString(),
             createdAt = Instant.now(),
             updatedAt = Instant.now(),
-            version = 1,
         )
 
     private fun aCheckpoint(jobId: String, createdAt: Instant, orderKey: Long) =

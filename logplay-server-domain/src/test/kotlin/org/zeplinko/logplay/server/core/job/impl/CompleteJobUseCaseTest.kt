@@ -55,9 +55,11 @@ class CompleteJobUseCaseTest {
 
         assertThat(result.name).isEqualTo(job.name)
         assertThat(result.type).isEqualTo(job.type)
-        assertThat(result.retries).isEqualTo(job.retries)
+        // retries is null for terminal jobs — the count isn't preserved on `jobs` once the
+        // secondary-table row is gone; audit events are the source of truth for past retries.
+        assertThat(result.retries).isNull()
         assertThat(result.createdAt).isEqualTo(job.createdAt)
-        assertThat(result.version).isEqualTo(job.version + 1)
+        assertThat(result.terminalAt).isNotNull()
     }
 
     @Test
@@ -100,7 +102,7 @@ class CompleteJobUseCaseTest {
     }
 
     @Test
-    fun `execute should throw JobNotAcquiredException for all non-ACQUIRED statuses`() = runTest {
+    fun `execute should throw JobNotAcquiredException carrying the actual status`() = runTest {
         for (status in
             listOf(JobStatus.PENDING, JobStatus.FINISHED, JobStatus.FAILED, JobStatus.ABORTED)) {
             val localGateway = InMemoryJobGateway()
@@ -117,6 +119,7 @@ class CompleteJobUseCaseTest {
             assertThat(exception)
                 .describedAs("expected JobNotAcquiredException for status $status")
                 .isInstanceOf(JobNotAcquiredException::class.java)
+            assertThat((exception as JobNotAcquiredException).status).isEqualTo(status)
         }
     }
 
@@ -145,10 +148,9 @@ class CompleteJobUseCaseTest {
             type = "test-type",
             status = status,
             retries = 0,
-            idempotencyKey = UUID.randomUUID().toString(),
             createdAt = Instant.now(),
             updatedAt = Instant.now(),
             acquiredByWorkerId = acquiredByWorkerId,
-            version = 1,
+            lastAcquiredAt = if (status == JobStatus.ACQUIRED) Instant.now() else null,
         )
 }

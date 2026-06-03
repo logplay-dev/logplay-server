@@ -10,6 +10,8 @@ class ReleaseJobUseCaseImpl(private val jobGateway: JobGateway) : ReleaseJobUseC
         if (command.jobId.isBlank()) throw BlankJobIdException()
         if (command.workerId.isBlank()) throw BlankWorkerIdException()
         val now = Instant.now()
+        val availableAt = command.availableAt ?: 0L
+        val eventDetail = if (availableAt != 0L) """{"availableAt":$availableAt}""" else null
         val event =
             JobEvent(
                 id = UUID.randomUUID().toString(),
@@ -19,15 +21,18 @@ class ReleaseJobUseCaseImpl(private val jobGateway: JobGateway) : ReleaseJobUseC
                 actorId = command.workerId,
                 createdAt = now,
                 eventMessage = null,
-                eventDetail = null,
+                eventDetail = eventDetail,
             )
-        val released = jobGateway.releaseJob(command.jobId, command.workerId, now, event)
-        if (released != null) return released
-        val job = jobGateway.findJobById(command.jobId) ?: throw JobNotFoundException(command.jobId)
-        if (job.status != JobStatus.ACQUIRED)
-            throw JobNotAcquiredException(command.jobId, job.status)
-        if (job.acquiredByWorkerId != command.workerId)
-            throw JobNotOwnedByWorkerException(command.jobId, command.workerId)
-        throw JobConcurrentModificationException(command.jobId)
+        return when (
+            val result =
+                jobGateway.releaseJob(command.jobId, command.workerId, now, availableAt, event)
+        ) {
+            is ReleaseJobResult.Success -> result.job
+            is ReleaseJobResult.NotFound -> throw JobNotFoundException(command.jobId)
+            is ReleaseJobResult.WrongStatus ->
+                throw JobNotAcquiredException(command.jobId, result.status)
+            is ReleaseJobResult.WrongWorker ->
+                throw JobNotOwnedByWorkerException(command.jobId, command.workerId)
+        }
     }
 }

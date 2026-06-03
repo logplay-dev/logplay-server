@@ -19,11 +19,11 @@ class AbortJobUseCaseImpl(private val jobGateway: JobGateway) : AbortJobUseCase 
                 eventMessage = null,
                 eventDetail = null,
             )
-        val aborted = jobGateway.abortJob(command.jobId, now, event)
-        if (aborted != null) return aborted
-        val job = jobGateway.findJobById(command.jobId) ?: throw JobNotFoundException(command.jobId)
-        if (job.status != JobStatus.PENDING && job.status != JobStatus.ACQUIRED)
-            throw JobNotAbortableException(command.jobId, job.status)
-        throw JobConcurrentModificationException(command.jobId)
+        return when (val result = jobGateway.abortJob(command.jobId, now, event)) {
+            is AbortJobResult.Success -> result.job
+            is AbortJobResult.NotFound -> throw JobNotFoundException(command.jobId)
+            is AbortJobResult.AlreadyTerminal ->
+                throw JobNotAbortableException(command.jobId, result.status)
+        }
     }
 }

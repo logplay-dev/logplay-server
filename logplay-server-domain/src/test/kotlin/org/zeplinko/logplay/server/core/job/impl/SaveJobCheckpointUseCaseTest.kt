@@ -291,31 +291,26 @@ class SaveJobCheckpointUseCaseTest {
     // --- Retry reset ---
 
     @Test
-    fun `execute should reset retries to zero and increment version when job has retries greater than zero`() =
-        runTest {
-            val job =
-                aJob(status = JobStatus.ACQUIRED, acquiredByWorkerId = workerId).copy(retries = 3)
-            gateway.save(job)
+    fun `execute should reset retries to zero when job has retries greater than zero`() = runTest {
+        val job = aJob(status = JobStatus.ACQUIRED, acquiredByWorkerId = workerId).copy(retries = 3)
+        gateway.save(job)
 
-            useCase.execute(SaveJobCheckpointCommand(job.id, workerId, null, null, byteArrayOf()))
+        useCase.execute(SaveJobCheckpointCommand(job.id, workerId, null, null, byteArrayOf()))
 
-            val updated = gateway.findJobById(job.id)!!
-            assertThat(updated.retries).isEqualTo(0)
-            assertThat(updated.version).isEqualTo(job.version + 1)
-        }
+        val updated = gateway.findJobById(job.id)!!
+        assertThat(updated.retries).isEqualTo(0)
+    }
 
     @Test
-    fun `execute should keep retries at zero and increment version when retries are already zero`() =
-        runTest {
-            val job = aJob(status = JobStatus.ACQUIRED, acquiredByWorkerId = workerId)
-            gateway.save(job)
+    fun `execute should keep retries at zero when retries are already zero`() = runTest {
+        val job = aJob(status = JobStatus.ACQUIRED, acquiredByWorkerId = workerId)
+        gateway.save(job)
 
-            useCase.execute(SaveJobCheckpointCommand(job.id, workerId, null, null, byteArrayOf()))
+        useCase.execute(SaveJobCheckpointCommand(job.id, workerId, null, null, byteArrayOf()))
 
-            val updated = gateway.findJobById(job.id)!!
-            assertThat(updated.retries).isEqualTo(0)
-            assertThat(updated.version).isEqualTo(job.version + 1)
-        }
+        val updated = gateway.findJobById(job.id)!!
+        assertThat(updated.retries).isEqualTo(0)
+    }
 
     // --- State ---
 
@@ -340,7 +335,7 @@ class SaveJobCheckpointUseCaseTest {
     }
 
     @Test
-    fun `execute should throw JobNotAcquiredException for all non-ACQUIRED statuses`() = runTest {
+    fun `execute should throw JobNotAcquiredException carrying the actual status`() = runTest {
         for (status in
             listOf(JobStatus.PENDING, JobStatus.FINISHED, JobStatus.FAILED, JobStatus.ABORTED)) {
             val localGateway = InMemoryJobGateway()
@@ -365,6 +360,7 @@ class SaveJobCheckpointUseCaseTest {
             assertThat(exception)
                 .describedAs("expected JobNotAcquiredException for status $status")
                 .isInstanceOf(JobNotAcquiredException::class.java)
+            assertThat((exception as JobNotAcquiredException).status).isEqualTo(status)
             assertThat(localGateway.checkpointCount()).isEqualTo(0)
         }
     }
@@ -389,6 +385,45 @@ class SaveJobCheckpointUseCaseTest {
             assertThat(gateway.checkpointCount()).isEqualTo(0)
         }
 
+    @Test
+    fun `execute should throw and not persist when lease is revoked between compute and write`() =
+        runTest {
+            val job = aJob(status = JobStatus.ACQUIRED, acquiredByWorkerId = workerId)
+            gateway.save(job)
+            // Simulate a concurrent dead-worker cleanup landing in the race window: after the
+            // gateway has computed the new checkpoint but before it commits the retries-reset.
+            gateway.onAfterCheckpointCompute = {
+                kotlinx.coroutines.runBlocking {
+                    gateway.releaseJobsByWorkerId(workerId, Instant.now()) { jobId ->
+                        JobEvent(
+                            id = UUID.randomUUID().toString(),
+                            jobId = jobId,
+                            eventType = JobEventType.RELEASED,
+                            actorType = ActorType.SYSTEM,
+                            actorId = null,
+                            createdAt = Instant.now(),
+                            eventMessage = "test concurrent release",
+                            eventDetail = null,
+                        )
+                    }
+                }
+            }
+
+            val exception =
+                runCatching {
+                        useCase.execute(
+                            SaveJobCheckpointCommand(job.id, workerId, null, "step", byteArrayOf())
+                        )
+                    }
+                    .exceptionOrNull()
+
+            // Job is now PENDING after the release; the gateway re-classifies the post-compute
+            // state and surfaces it as JobNotAcquiredException with the actual PENDING status.
+            assertThat(exception).isInstanceOf(JobNotAcquiredException::class.java)
+            assertThat((exception as JobNotAcquiredException).status).isEqualTo(JobStatus.PENDING)
+            assertThat(gateway.checkpointCount()).isEqualTo(0)
+        }
+
     // --- Helpers ---
 
     private fun aJob(status: JobStatus, acquiredByWorkerId: String? = null) =
@@ -399,10 +434,9 @@ class SaveJobCheckpointUseCaseTest {
             type = "test-type",
             status = status,
             retries = 0,
-            idempotencyKey = UUID.randomUUID().toString(),
             createdAt = Instant.now(),
             updatedAt = Instant.now(),
             acquiredByWorkerId = acquiredByWorkerId,
-            version = 1,
+            lastAcquiredAt = if (status == JobStatus.ACQUIRED) Instant.now() else null,
         )
 }

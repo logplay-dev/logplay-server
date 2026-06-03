@@ -1,20 +1,56 @@
 CREATE TABLE jobs (
+    -- id is derived deterministically from (group_id, idempotency_key) via JobIdGenerator.
+    -- The idempotency key itself is not stored: the SDK sends it on create, the server hashes
+    -- it into `id`, and any future lookup by key re-derives the id client-side. Uniqueness on
+    -- (group_id, idempotency_key) is therefore enforced transitively by the PK on `id`.
     id VARCHAR(64) PRIMARY KEY,
     group_id VARCHAR(64) NOT NULL,
     name VARCHAR(256) NOT NULL,
     type VARCHAR(512) NOT NULL,
-    status VARCHAR(64) NOT NULL,
-    retries INT NOT NULL DEFAULT 0,
     max_retries INT NULL,
-    created_at BIGINT NOT NULL,
-    updated_at BIGINT NOT NULL,
-    version BIGINT NOT NULL DEFAULT 0,
-    last_acquired_at BIGINT NULL,
-    acquired_by_worker_id VARCHAR(64) NULL,
-    idempotency_key VARCHAR(64) NOT NULL,
     input_data BYTEA NULL,
-    output_data BYTEA NULL
+    output_data BYTEA NULL,
+    created_at BIGINT NOT NULL,
+    terminal_status VARCHAR(64) NULL,
+    terminal_at BIGINT NULL
 );
+
+CREATE TABLE workers (
+    id VARCHAR(64) PRIMARY KEY,
+    heartbeat_timeout BIGINT NOT NULL,
+    session_timeout BIGINT NOT NULL,
+    last_heartbeat_at BIGINT NOT NULL,
+    registered_at BIGINT NOT NULL,
+    condemned BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+-- PENDING references; rows here are time-gated by available_at and ordered by enqueued_at.
+-- available_at = 0 means "available immediately" — sentinel so the predicate stays a plain range scan.
+CREATE TABLE job_queue (
+    job_id VARCHAR(64) PRIMARY KEY,
+    group_id VARCHAR(64) NOT NULL,
+    type VARCHAR(512) NOT NULL,
+    enqueued_at BIGINT NOT NULL,
+    retries INT NOT NULL DEFAULT 0,
+    available_at BIGINT NOT NULL DEFAULT 0,
+    CONSTRAINT fk_job_queue_job FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+);
+
+-- ACQUIRED references; one row per in-flight job.
+CREATE TABLE job_acquired (
+    job_id VARCHAR(64) PRIMARY KEY,
+    group_id VARCHAR(64) NOT NULL,
+    type VARCHAR(512) NOT NULL,
+    acquired_by_worker_id VARCHAR(64) NOT NULL,
+    acquired_at BIGINT NOT NULL,
+    retries INT NOT NULL DEFAULT 0,
+    CONSTRAINT fk_job_acquired_job FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+    CONSTRAINT fk_job_acquired_worker FOREIGN KEY (acquired_by_worker_id) REFERENCES workers(id)
+);
+
+-- Acquisition index: equality on (group_id, type), range on available_at, FIFO by enqueued_at.
+CREATE INDEX idx_job_queue_acquire_ready ON job_queue(group_id, type, available_at, enqueued_at);
+CREATE INDEX idx_job_acquired_worker ON job_acquired(acquired_by_worker_id);
 
 CREATE TABLE checkpoints (
     id VARCHAR(64) PRIMARY KEY,
@@ -27,25 +63,6 @@ CREATE TABLE checkpoints (
     CONSTRAINT fk_checkpoint_job FOREIGN KEY (job_id) REFERENCES jobs(id),
     CONSTRAINT fk_checkpoint_previous FOREIGN KEY (previous_checkpoint_id) REFERENCES checkpoints(id)
 );
-
-CREATE TABLE workers (
-    id VARCHAR(64) PRIMARY KEY,
-    heartbeat_timeout BIGINT NOT NULL,
-    session_timeout BIGINT NOT NULL,
-    last_heartbeat_at BIGINT NOT NULL,
-    registered_at BIGINT NOT NULL,
-    condemned BOOLEAN NOT NULL DEFAULT FALSE
-);
-
--- Jobs foreign keys
-ALTER TABLE jobs ADD CONSTRAINT fk_job_acquired_worker FOREIGN KEY (acquired_by_worker_id) REFERENCES workers(id);
-
--- Jobs indexes
--- Idempotency uniqueness is enforced by the primary key: jobs.id is derived
--- deterministically from (group_id, idempotency_key) via JobIdGenerator, so a
--- duplicate insert collides on the PK and no separate unique index is needed.
-CREATE INDEX idx_jobs_status_updated_at ON jobs(group_id, type, status, updated_at);
-CREATE INDEX idx_jobs_acquired_worker ON jobs(acquired_by_worker_id, status);
 
 -- Checkpoints indexes
 -- Chain uniqueness is enforced by the primary key: checkpoints.id is derived
