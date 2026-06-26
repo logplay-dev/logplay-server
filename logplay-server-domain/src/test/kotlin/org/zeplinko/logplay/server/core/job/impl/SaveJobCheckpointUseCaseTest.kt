@@ -6,6 +6,7 @@ import kotlinx.coroutines.test.runTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.zeplinko.logplay.server.core.fakes.InMemoryUnitOfWork
 import org.zeplinko.logplay.server.core.job.*
 import org.zeplinko.logplay.server.core.job.fakes.InMemoryJobGateway
 import org.zeplinko.logplay.server.core.worker.BlankWorkerIdException
@@ -20,7 +21,7 @@ class SaveJobCheckpointUseCaseTest {
     @BeforeEach
     fun setUp() {
         gateway = InMemoryJobGateway()
-        useCase = SaveJobCheckpointUseCaseImpl(gateway)
+        useCase = SaveJobCheckpointUseCaseImpl(gateway, InMemoryUnitOfWork())
     }
 
     // --- Happy path ---
@@ -344,7 +345,7 @@ class SaveJobCheckpointUseCaseTest {
 
             val exception =
                 runCatching {
-                        SaveJobCheckpointUseCaseImpl(localGateway)
+                        SaveJobCheckpointUseCaseImpl(localGateway, InMemoryUnitOfWork())
                             .execute(
                                 SaveJobCheckpointCommand(
                                     job.id,
@@ -382,45 +383,6 @@ class SaveJobCheckpointUseCaseTest {
                     .exceptionOrNull()
 
             assertThat(exception).isInstanceOf(JobNotOwnedByWorkerException::class.java)
-            assertThat(gateway.checkpointCount()).isEqualTo(0)
-        }
-
-    @Test
-    fun `execute should throw and not persist when lease is revoked between compute and write`() =
-        runTest {
-            val job = aJob(status = JobStatus.ACQUIRED, acquiredByWorkerId = workerId)
-            gateway.save(job)
-            // Simulate a concurrent dead-worker cleanup landing in the race window: after the
-            // gateway has computed the new checkpoint but before it commits the retries-reset.
-            gateway.onAfterCheckpointCompute = {
-                kotlinx.coroutines.runBlocking {
-                    gateway.releaseJobsByWorkerId(workerId, Instant.now()) { jobId ->
-                        JobEvent(
-                            id = UUID.randomUUID().toString(),
-                            jobId = jobId,
-                            eventType = JobEventType.RELEASED,
-                            actorType = ActorType.SYSTEM,
-                            actorId = null,
-                            createdAt = Instant.now(),
-                            eventMessage = "test concurrent release",
-                            eventDetail = null,
-                        )
-                    }
-                }
-            }
-
-            val exception =
-                runCatching {
-                        useCase.execute(
-                            SaveJobCheckpointCommand(job.id, workerId, null, "step", byteArrayOf())
-                        )
-                    }
-                    .exceptionOrNull()
-
-            // Job is now PENDING after the release; the gateway re-classifies the post-compute
-            // state and surfaces it as JobNotAcquiredException with the actual PENDING status.
-            assertThat(exception).isInstanceOf(JobNotAcquiredException::class.java)
-            assertThat((exception as JobNotAcquiredException).status).isEqualTo(JobStatus.PENDING)
             assertThat(gateway.checkpointCount()).isEqualTo(0)
         }
 

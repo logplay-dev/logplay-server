@@ -15,14 +15,12 @@ interface RegisterWorkerUseCase {
 }
 
 /**
- * Refreshes a worker's `lastHeartbeatAt` timestamp, proving liveness. Heartbeats from condemned
- * workers are rejected so the cleanup phase can safely release their jobs.
+ * Refreshes a worker's `lastHeartbeatAt` timestamp, proving liveness. A worker that has already
+ * timed out (`now - lastHeartbeatAt > sessionTimeout`) cannot heartbeat back to life — it is
+ * treated as gone and must re-register.
  */
 interface HeartbeatWorkerUseCase {
-    /**
-     * @throws WorkerNotFoundException if the worker is not registered.
-     * @throws WorkerCondemnedException if the worker has been condemned and is awaiting deletion.
-     */
+    /** @throws WorkerNotFoundException if the worker is not registered or has already timed out. */
     suspend fun execute(command: HeartbeatWorkerCommand): Worker
 }
 
@@ -36,14 +34,11 @@ interface DeregisterWorkerUseCase {
 }
 
 /**
- * Two-phase cleanup of dead workers, intended to run on a periodic schedule:
- * 1. Condemn workers whose `lastHeartbeatAt` is older than their `sessionTimeout`.
- * 2. Release the jobs held by previously-condemned workers (after a grace period) and delete those
- *    worker records.
- *
- * The grace period is configured at the use-case level — see the implementation.
+ * Single-pass cleanup of dead workers, intended to run on a periodic schedule: for each worker
+ * whose `lastHeartbeatAt` is older than its `sessionTimeout`, release the jobs it holds back to
+ * `PENDING` and delete the worker record — atomically, in one transaction.
  */
 interface CleanupDeadWorkersUseCase {
-    /** @return the number of workers deleted in this run (excludes those merely condemned). */
+    /** @return the number of dead workers reclaimed (jobs released + row deleted) in this run. */
     suspend fun execute(): Int
 }

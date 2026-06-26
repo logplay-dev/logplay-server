@@ -9,6 +9,7 @@ import org.flywaydb.core.Flyway
 import org.slf4j.LoggerFactory
 import org.zeplinko.logplay.server.MainVerticle
 import org.zeplinko.logplay.server.job.adapters.PostgresJobGateway
+import org.zeplinko.logplay.server.job.adapters.PostgresUnitOfWork
 import org.zeplinko.logplay.server.job.adapters.PostgresWorkerGateway
 
 private val logger = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass())
@@ -48,7 +49,13 @@ fun main() {
             .using(vertx)
             .build()
     vertx
-        .deployVerticle(MainVerticle(PostgresJobGateway(pool), PostgresWorkerGateway(pool)))
+        .deployVerticle(
+            MainVerticle(
+                PostgresJobGateway(pool),
+                PostgresWorkerGateway(pool),
+                PostgresUnitOfWork(pool),
+            )
+        )
         .onFailure { error ->
             logger.error("Failed to start server", error)
             vertx.close()

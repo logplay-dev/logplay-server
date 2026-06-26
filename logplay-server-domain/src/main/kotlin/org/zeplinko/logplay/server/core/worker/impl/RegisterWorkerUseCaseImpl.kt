@@ -1,9 +1,13 @@
 package org.zeplinko.logplay.server.core.worker.impl
 
 import java.time.Instant
+import org.zeplinko.logplay.server.core.UnitOfWork
 import org.zeplinko.logplay.server.core.worker.*
 
-class RegisterWorkerUseCaseImpl(private val workerGateway: WorkerGateway) : RegisterWorkerUseCase {
+class RegisterWorkerUseCaseImpl(
+    private val workerGateway: WorkerGateway,
+    private val unitOfWork: UnitOfWork,
+) : RegisterWorkerUseCase {
 
     companion object {
         const val MAX_WORKER_ID_LENGTH = 64
@@ -11,9 +15,6 @@ class RegisterWorkerUseCaseImpl(private val workerGateway: WorkerGateway) : Regi
 
     override suspend fun execute(command: RegisterWorkerCommand): Worker {
         validate(command)
-        val existing = workerGateway.findWorkerById(command.workerId)
-        if (existing != null) throw WorkerAlreadyRegisteredException(command.workerId)
-
         val now = Instant.now()
         val worker =
             Worker(
@@ -23,7 +24,24 @@ class RegisterWorkerUseCaseImpl(private val workerGateway: WorkerGateway) : Regi
                 lastHeartbeatAt = now,
                 registeredAt = now,
             )
-        return workerGateway.insertWorker(worker)
+        // The unique constraint on workers(id) is the authoritative duplicate guard:
+        // insertWorker translates a PK collision into WorkerAlreadyRegisteredException, so no
+        // (racy) pre-check is needed.
+        return try {
+            workerGateway.insertWorker(worker)
+        } catch (e: WorkerAlreadyRegisteredException) {
+            // Enrich the conflict with the colliding worker's liveness so the 409 tells the caller
+            // whether it clashed with an active worker or one that has timed out and is awaiting
+            // cleanup. If the row was reaped between the failed insert and this read, the conflict
+            // is gone — surface the original (generic) exception rather than guessing.
+            val existing =
+                unitOfWork.transaction { workerGateway.findAndLockWorkerById(command.workerId) }
+                    ?: throw e
+            throw WorkerAlreadyRegisteredException(
+                command.workerId,
+                alive = !existing.isDeadAt(now),
+            )
+        }
     }
 
     private fun validate(command: RegisterWorkerCommand) {

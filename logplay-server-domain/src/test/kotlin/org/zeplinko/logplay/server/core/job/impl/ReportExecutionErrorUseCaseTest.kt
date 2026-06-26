@@ -6,6 +6,7 @@ import kotlinx.coroutines.test.runTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.zeplinko.logplay.server.core.fakes.InMemoryUnitOfWork
 import org.zeplinko.logplay.server.core.job.*
 import org.zeplinko.logplay.server.core.job.fakes.InMemoryJobGateway
 import org.zeplinko.logplay.server.core.worker.BlankWorkerIdException
@@ -20,7 +21,7 @@ class ReportExecutionErrorUseCaseTest {
     @BeforeEach
     fun setUp() {
         gateway = InMemoryJobGateway()
-        useCase = ReportExecutionErrorUseCaseImpl(gateway)
+        useCase = ReportExecutionErrorUseCaseImpl(gateway, InMemoryUnitOfWork())
     }
 
     // --- Happy path ---
@@ -226,7 +227,7 @@ class ReportExecutionErrorUseCaseTest {
 
             val exception =
                 runCatching {
-                        ReportExecutionErrorUseCaseImpl(localGateway)
+                        ReportExecutionErrorUseCaseImpl(localGateway, InMemoryUnitOfWork())
                             .execute(ReportExecutionErrorCommand(job.id, workerId, "error"))
                     }
                     .exceptionOrNull()

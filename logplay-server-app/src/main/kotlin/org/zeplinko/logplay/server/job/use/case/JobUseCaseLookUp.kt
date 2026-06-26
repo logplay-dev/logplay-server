@@ -1,5 +1,6 @@
 package org.zeplinko.logplay.server.job.use.case
 
+import org.zeplinko.logplay.server.core.UnitOfWork
 import org.zeplinko.logplay.server.core.job.*
 import org.zeplinko.logplay.server.core.job.impl.*
 import org.zeplinko.logplay.server.core.worker.WorkerGateway
@@ -10,17 +11,21 @@ import org.zeplinko.logplay.server.core.worker.WorkerGateway
  * use-case singletons. Keeping this explicit (no DI container) makes the dependency graph trivially
  * navigable.
  */
-class JobUseCaseLookUp(jobGateway: JobGateway, workerGateway: WorkerGateway) {
-    val createJobUseCase: CreateJobUseCase = CreateJobUseCaseImpl(jobGateway)
+class JobUseCaseLookUp(
+    jobGateway: JobGateway,
+    workerGateway: WorkerGateway,
+    unitOfWork: UnitOfWork,
+) {
+    val createJobUseCase: CreateJobUseCase = CreateJobUseCaseImpl(jobGateway, unitOfWork)
     val acquirePendingJobsUseCase: AcquirePendingJobsUseCase =
-        AcquirePendingJobsUseCaseImpl(jobGateway, workerGateway)
+        AcquirePendingJobsUseCaseImpl(jobGateway, workerGateway, unitOfWork)
     val saveJobCheckpointUseCase: SaveJobCheckpointUseCase =
-        SaveJobCheckpointUseCaseImpl(jobGateway)
+        SaveJobCheckpointUseCaseImpl(jobGateway, unitOfWork)
     val getCheckpointsUseCase: GetCheckpointsUseCase = GetCheckpointsUseCaseImpl(jobGateway)
-    val completeJobUseCase: CompleteJobUseCase = CompleteJobUseCaseImpl(jobGateway)
-    val releaseJobUseCase: ReleaseJobUseCase = ReleaseJobUseCaseImpl(jobGateway)
+    val completeJobUseCase: CompleteJobUseCase = CompleteJobUseCaseImpl(jobGateway, unitOfWork)
+    val releaseJobUseCase: ReleaseJobUseCase = ReleaseJobUseCaseImpl(jobGateway, unitOfWork)
     val reportExecutionErrorUseCase: ReportExecutionErrorUseCase =
-        ReportExecutionErrorUseCaseImpl(jobGateway)
-    val abortJobUseCase: AbortJobUseCase = AbortJobUseCaseImpl(jobGateway)
+        ReportExecutionErrorUseCaseImpl(jobGateway, unitOfWork)
+    val abortJobUseCase: AbortJobUseCase = AbortJobUseCaseImpl(jobGateway, unitOfWork)
     val getJobEventsUseCase: GetJobEventsUseCase = GetJobEventsUseCaseImpl(jobGateway)
 }

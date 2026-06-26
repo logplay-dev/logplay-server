@@ -6,11 +6,11 @@ import kotlinx.coroutines.test.runTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.zeplinko.logplay.server.core.fakes.InMemoryUnitOfWork
 import org.zeplinko.logplay.server.core.job.*
 import org.zeplinko.logplay.server.core.job.fakes.InMemoryJobGateway
 import org.zeplinko.logplay.server.core.worker.BlankWorkerIdException
 import org.zeplinko.logplay.server.core.worker.Worker
-import org.zeplinko.logplay.server.core.worker.WorkerCondemnedException
 import org.zeplinko.logplay.server.core.worker.WorkerNotFoundException
 import org.zeplinko.logplay.server.core.worker.fakes.InMemoryWorkerGateway
 
@@ -25,8 +25,8 @@ class AcquirePendingJobsUseCaseTest {
     @BeforeEach
     fun setUp() {
         workerGateway = InMemoryWorkerGateway()
-        jobGateway = InMemoryJobGateway(workerGateway)
-        useCase = AcquirePendingJobsUseCaseImpl(jobGateway, workerGateway)
+        jobGateway = InMemoryJobGateway()
+        useCase = AcquirePendingJobsUseCaseImpl(jobGateway, workerGateway, InMemoryUnitOfWork())
         workerGateway.save(aWorker(workerId))
     }
 
@@ -137,48 +137,38 @@ class AcquirePendingJobsUseCaseTest {
         }
 
     @Test
-    fun `execute should throw WorkerCondemnedException when worker is condemned and jobs exist`() =
+    fun `execute should throw WorkerNotFoundException when worker has timed out and jobs exist`() =
         runTest {
-            workerGateway.save(aWorker("condemned-worker").copy(condemned = true))
+            workerGateway.save(aDeadWorker("dead-worker"))
             val job = aJob()
             jobGateway.save(job)
 
             val exception =
                 runCatching {
                         useCase.execute(
-                            AcquirePendingJobsCommand(
-                                "test-group",
-                                "test-type",
-                                "condemned-worker",
-                                10,
-                            )
+                            AcquirePendingJobsCommand("test-group", "test-type", "dead-worker", 10)
                         )
                     }
                     .exceptionOrNull()
 
-            assertThat(exception).isInstanceOf(WorkerCondemnedException::class.java)
+            assertThat(exception).isInstanceOf(WorkerNotFoundException::class.java)
             assertThat(jobGateway.findJobById(job.id)!!.status).isEqualTo(JobStatus.PENDING)
         }
 
     @Test
-    fun `execute should throw WorkerCondemnedException when worker is condemned and no jobs exist`() =
+    fun `execute should throw WorkerNotFoundException when worker has timed out and no jobs exist`() =
         runTest {
-            workerGateway.save(aWorker("condemned-worker").copy(condemned = true))
+            workerGateway.save(aDeadWorker("dead-worker"))
 
             val exception =
                 runCatching {
                         useCase.execute(
-                            AcquirePendingJobsCommand(
-                                "test-group",
-                                "test-type",
-                                "condemned-worker",
-                                10,
-                            )
+                            AcquirePendingJobsCommand("test-group", "test-type", "dead-worker", 10)
                         )
                     }
                     .exceptionOrNull()
 
-            assertThat(exception).isInstanceOf(WorkerCondemnedException::class.java)
+            assertThat(exception).isInstanceOf(WorkerNotFoundException::class.java)
         }
 
     @Test
@@ -283,6 +273,10 @@ class AcquirePendingJobsUseCaseTest {
             lastHeartbeatAt = Instant.now(),
             registeredAt = Instant.now(),
         )
+
+    /** A worker whose last heartbeat is far enough in the past to be past its `sessionTimeout`. */
+    private fun aDeadWorker(id: String) =
+        aWorker(id).copy(lastHeartbeatAt = Instant.now().minusSeconds(3600))
 
     private fun aJob(groupId: String = "test-group", type: String = "test-type") =
         Job(

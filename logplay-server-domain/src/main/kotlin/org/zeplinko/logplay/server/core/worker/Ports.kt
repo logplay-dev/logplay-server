@@ -3,14 +3,17 @@ package org.zeplinko.logplay.server.core.worker
 import java.time.Instant
 
 /**
- * Persistence port for worker registration, heartbeat, and the two-phase dead-worker cleanup.
- * Backend modules implement this interface.
+ * Persistence port for worker registration, heartbeat, and dead-worker cleanup. Backend modules
+ * implement this interface.
  *
- * **Two-phase cleanup semantics.** A worker that has not heartbeated within its `sessionTimeout` is
- * first marked `condemned = true` (locking it out of further heartbeats). After a grace period —
- * long enough that any in-flight heartbeat from the same worker would have either landed or be
- * noticed missing — the worker's jobs are released and its row is deleted. [condemnDeadWorkers]
- * implements phase 1; [findCondemnedWorkers] + [deleteWorkers] implement phase 2.
+ * **Liveness model.** A worker is *alive* while it has heartbeated within its `sessionTimeout`
+ * (`now - lastHeartbeatAt <= sessionTimeout`) and *dead* otherwise — there is no intermediate
+ * state. A single cleanup pass reclaims a dead worker's jobs and deletes its row atomically
+ * ([findAndLockDeadWorkers] + `releaseJobsByWorkerIds` + [deleteWorkers]). Heartbeat and acquire
+ * are gated on liveness, so a timed-out worker is rejected and must re-register. The `workers` row
+ * is the per-worker serialisation point: lifecycle ops lock it first ([findAndLockWorkerById] for
+ * deregister/acquire, [findAndLockDeadWorkers] for cleanup) so concurrent ops on the same worker
+ * serialise rather than racing the worker-delete against a job-acquire/release.
  */
 interface WorkerGateway {
     /**
@@ -21,37 +24,33 @@ interface WorkerGateway {
     suspend fun insertWorker(worker: Worker): Worker
 
     /**
-     * Updates the worker's `lastHeartbeatAt`. No-op (returns `null`) if the worker does not exist
-     * or is condemned.
+     * Updates the worker's `lastHeartbeatAt`, returning the updated worker. No-op (returns `null`)
+     * if the worker does not exist or is already dead (`heartbeatAt - lastHeartbeatAt >
+     * sessionTimeout`) — a timed-out worker cannot heartbeat back to life and must re-register.
      */
     suspend fun updateWorkerHeartbeat(workerId: String, heartbeatAt: Instant): Worker?
 
-    /** Looks up a worker by id. */
-    suspend fun findWorkerById(id: String): Worker?
+    /**
+     * Looks up a worker by id while taking a `FOR UPDATE` lock on its row, held until the enclosing
+     * transaction ends. The `workers` row is the per-worker serialisation point: deregister and
+     * acquire take it first (acquire then checks liveness), while cleanup locks dead rows via
+     * [findAndLockDeadWorkers]. Taking it before releasing jobs / deleting the row serialises
+     * concurrent ops on the same worker and avoids the jobs-row vs worker-row lock-order deadlock
+     * an unlocked read would allow.
+     */
+    suspend fun findAndLockWorkerById(id: String): Worker?
 
     /** Deletes a worker row. Caller is responsible for releasing the worker's jobs first. */
     suspend fun deleteWorker(id: String)
 
-    /**
-     * Marks a single worker `condemned = true`. Subsequent heartbeats from this worker are rejected
-     * by [updateWorkerHeartbeat].
-     */
-    suspend fun condemnWorker(id: String)
-
-    /**
-     * Phase 1 of dead-worker cleanup: condemns every worker whose `lastHeartbeatAt +
-     * sessionTimeout` is in the past relative to `now` and is not already condemned.
-     *
-     * @return the number of workers transitioned to `condemned` in this call.
-     */
-    suspend fun condemnDeadWorkers(now: Instant): Int
-
-    /** Bulk-deletes the given worker rows. Used at the end of phase 2. */
+    /** Bulk-deletes the given worker rows. Used at the end of a cleanup pass. */
     suspend fun deleteWorkers(ids: List<String>)
 
     /**
-     * Phase 2 query: returns workers that have been condemned for at least `condemnPeriodMs`
-     * milliseconds, suitable for job release + deletion.
+     * Returns the dead workers (`now - lastHeartbeatAt > sessionTimeout`), locking their rows with
+     * `FOR UPDATE SKIP LOCKED` so concurrent cleanup passes (and a concurrent deregister) never
+     * reclaim the same worker twice — a worker already locked by another lifecycle op is skipped,
+     * not waited on, keeping cleanup deadlock-free against the blocking [findAndLockWorkerById].
      */
-    suspend fun findCondemnedWorkers(now: Instant, condemnPeriodMs: Long): List<Worker>
+    suspend fun findAndLockDeadWorkers(now: Instant): List<Worker>
 }

@@ -3,47 +3,46 @@ package org.zeplinko.logplay.server.core.job
 import java.time.Instant
 
 /**
- * Persistence port for jobs, checkpoints, and job events. Backend modules implement this interface
- * with database-specific transactional and concurrency primitives. The domain layer never touches a
- * driver directly.
+ * Persistence port for jobs, checkpoints, and job events — a set of fine-grained, mostly
+ * single-statement primitives the domain composes inside a `UnitOfWork` transaction. Backend
+ * modules implement it with database-specific SQL; the domain layer never touches a driver
+ * directly.
  *
  * **Three-table state machine.** Implementations split job state across three tables:
  * - `jobs` — authoritative metadata; touched only at creation and at terminal transitions.
  * - `job_queue` — references for `PENDING` jobs, time-gated by `available_at`.
  * - `job_acquired` — references for `ACQUIRED` jobs, bound to the owning worker.
  *
- * Every state transition (acquire, release, complete, abort, retryable error, exhausted error) is a
- * single transaction that opens with `SELECT 1 FROM jobs WHERE id = ? FOR UPDATE` to serialise
- * concurrent transitions for the same job, then performs rowcount-guarded `DELETE`+`INSERT` pairs
- * across the secondary tables, and finally writes the audit event.
+ * **Transaction model.** Methods are ambient: each runs on the connection of the enclosing
+ * `UnitOfWork.transaction { }` when one is open, and auto-commits standalone otherwise. A per-job
+ * state transition is orchestrated by its use case: [findAndLockJobById] takes `SELECT ... FOR
+ * UPDATE` to serialise concurrent transitions for the job, the use case classifies status/ownership
+ * from the returned [Job] (throwing the appropriate domain exception), then composes the mechanical
+ * writes ([removeFromQueue]/[removeFromAcquired], [enqueue]/[markTerminal], [insertCheckpoint],
+ * [insertEvents], ...) — all under that lock, in one transaction. A thrown domain exception rolls
+ * the transaction back.
  *
- * **Compute pattern.** [saveCheckpoint] and [reportExecutionError] accept a `compute` lambda that
- * runs inside the transaction with the locked job (and, where applicable, the latest checkpoint)
- * already loaded. This keeps domain logic — id derivation, retry math, event creation — free of any
- * driver knowledge while still letting the gateway own locking semantics.
+ * **Set-based operations.** [acquirePendingJobs] and [releaseJobsByWorkerIds] move rows in bulk
+ * (`SELECT ... FOR UPDATE SKIP LOCKED` / batched `DELETE`+`INSERT`); they carry no business logic,
+ * and the use case builds any resulting events via [insertEvents] in the same transaction.
  *
- * **Typed transition results.** State-transition methods ([abortJob], [completeJob], [releaseJob],
- * [reportExecutionError], [saveCheckpoint]) return a sealed result type rather than a nullable
- * value. Each variant carries the precise reason classified *under the same row lock* that gated
- * the transition (job missing, already terminal, wrong status, wrong worker). The use-case layer
- * pattern-matches the result into the appropriate domain exception without a second lookup, so the
- * reported failure reason is never racy with respect to subsequent state changes.
+ * **Constraint-backed guards.** [insertJob] and [insertCheckpoint] surface unique-constraint
+ * collisions as [DuplicateJobIdException] / [InvalidCheckpointOrderException]; the use case maps or
+ * pre-validates as needed.
  */
 interface JobGateway {
     /**
      * Atomically claims up to `limit` `PENDING` jobs matching `(groupId, type)` whose `available_at
-     * <= now`, transitioning them to `ACQUIRED` and binding them to `workerId`. Implementations
-     * must use `SELECT ... FOR UPDATE SKIP LOCKED` (or equivalent) ordered by `enqueued_at ASC`.
-     *
-     * @param eventFactory optional factory invoked once per acquired job; the resulting events are
-     *   inserted in the same transaction as the move from `job_queue` to `job_acquired`.
+     * <= now`, transitioning them to `ACQUIRED` and binding them to `workerId`, and returns the
+     * acquired jobs. Implementations use `SELECT ... FOR UPDATE SKIP LOCKED` (or equivalent)
+     * ordered by `enqueued_at ASC`. Enlists in the caller's transaction; the use case builds and
+     * persists the `ACQUIRED` events via [insertEvents] within the same transaction.
      */
     suspend fun acquirePendingJobs(
         groupId: String,
         type: String,
         workerId: String,
         limit: Int,
-        eventFactory: ((Job) -> JobEvent)? = null,
     ): List<Job>
 
     /**
@@ -54,24 +53,22 @@ interface JobGateway {
     suspend fun findJobById(id: String): Job?
 
     /**
-     * Appends a checkpoint to the job's chain inside a single transaction. The implementation locks
-     * the job row (`SELECT ... FOR UPDATE`), verifies ownership via `job_acquired`, loads the
-     * latest checkpoint, calls `compute` to construct the new checkpoint from the latest tail,
-     * inserts it, and resets `retries` to 0 on the corresponding `job_acquired` row.
-     *
-     * @return a [SaveCheckpointResult] classifying success or the precondition failure.
-     * @throws InvalidCheckpointOrderException when the checkpoint chain unique constraint is
-     *   violated (e.g. concurrent writers targeting the same chain position).
+     * Locks the job row (`SELECT ... FOR UPDATE`) and returns the assembled [Job], or `null` if no
+     * job with [id] exists. Must be called inside a `UnitOfWork` transaction; the lock is held for
+     * the rest of that transaction, serialising concurrent state transitions for the same job. The
+     * use case classifies status/ownership from the returned [Job] (or throws on `null`).
      */
-    suspend fun saveCheckpoint(
-        jobId: String,
-        workerId: String,
-        updatedAt: Instant,
-        compute: (Checkpoint?) -> Checkpoint,
-    ): SaveCheckpointResult
+    suspend fun findAndLockJobById(id: String): Job?
 
     /** Looks up a checkpoint by primary key. */
     suspend fun findCheckpointById(id: String): Checkpoint?
+
+    /**
+     * Returns the tail (highest `orderKey`) checkpoint of the job's chain, or `null` if it has
+     * none. Intended to run inside a transaction after [findAndLockJobById], so it is serialised by
+     * the job lock and takes no lock of its own.
+     */
+    suspend fun latestCheckpoint(jobId: String): Checkpoint?
 
     /**
      * Returns up to `limit` checkpoints for the job, ordered by `orderKey ASC`. When
@@ -84,162 +81,69 @@ interface JobGateway {
     ): List<Checkpoint>
 
     /**
-     * Records an execution error inside a single transaction. The `compute` lambda is invoked with
-     * the locked job and returns the new status, retry count, and the events to emit (typically
-     * `ERROR_REPORTED`, plus `FAILED` if retries are exhausted).
-     *
-     * On `PENDING` (retryable), the row is moved from `job_acquired` back into `job_queue` with
-     * `available_at = 0` and the new retry count. On `FAILED`, the row is removed from
-     * `job_acquired` and `jobs.terminal_status` is set.
-     *
-     * @return a [ReportExecutionErrorResult] classifying success or the precondition failure.
+     * Lambda-free, ambient variant of [releaseJobsByWorkerIds] returning the released job ids. The
+     * use case builds and persists the `RELEASED` events via [insertEvents] in the same
+     * transaction.
      */
-    suspend fun reportExecutionError(
-        jobId: String,
-        workerId: String,
-        updatedAt: Instant,
-        compute: (Job) -> ExecutionErrorResult,
-    ): ReportExecutionErrorResult
+    suspend fun releaseJobsByWorkerIds(workerIds: List<String>, updatedAt: Instant): List<String>
 
     /**
-     * Transitions an `ACQUIRED` job to `FINISHED`, optionally storing `outputData`, and emits the
-     * `COMPLETED` event in the same transaction. Removes the row from `job_acquired` and writes
-     * `jobs.terminal_status = 'FINISHED'`.
+     * Inserts the `jobs` row and its `job_queue` entry (PENDING, `retries = 0`, `available_at =
+     * 0`).
      *
-     * @return a [CompleteJobResult] classifying success or the precondition failure.
+     * @throws DuplicateJobIdException on a primary-key collision; the use case maps this to its
+     *   richer idempotency-key conflict.
      */
-    suspend fun completeJob(
+    suspend fun insertJob(newJob: NewJob)
+
+    /** Appends audit events in a single batch. No-op for an empty list. */
+    suspend fun insertEvents(events: List<JobEvent>)
+
+    /** Deletes the job's `job_queue` row, if present. */
+    suspend fun removeFromQueue(jobId: String)
+
+    /**
+     * Deletes the job's `job_acquired` row, if present. Ownership is the caller's concern — it is
+     * verified under [findAndLockJobById] before this is called, so no worker filter is applied
+     * here.
+     */
+    suspend fun removeFromAcquired(jobId: String)
+
+    /** Inserts a `job_queue` row with the given retry count and `available_at` floor. */
+    suspend fun enqueue(
         jobId: String,
-        workerId: String,
+        groupId: String,
+        type: String,
+        enqueuedAt: Instant,
+        retries: Int,
+        availableAt: Long,
+    )
+
+    /**
+     * Writes the terminal transition on `jobs` (`terminal_status`, `terminal_at`, and `output_data`
+     * — pass `null` for non-`FINISHED` transitions). Does not touch the secondary tables; the
+     * caller removes the `job_queue`/`job_acquired` row first.
+     */
+    suspend fun markTerminal(
+        jobId: String,
+        status: JobStatus,
+        terminalAt: Instant,
         outputData: ByteArray?,
-        updatedAt: Instant,
-        event: JobEvent,
-    ): CompleteJobResult
+    )
 
     /**
-     * Transitions a `PENDING` or `ACQUIRED` job to `ABORTED`, removing it from whichever secondary
-     * table it currently lives in, and emits the `ABORTED` event in the same transaction.
+     * Inserts a checkpoint into the job's chain.
      *
-     * @return an [AbortJobResult] classifying success or the precondition failure.
+     * @throws InvalidCheckpointOrderException on a chain-constraint collision — a concurrency
+     *   backstop; the use case validates chain order against [latestCheckpoint] first.
      */
-    suspend fun abortJob(jobId: String, updatedAt: Instant, event: JobEvent): AbortJobResult
+    suspend fun insertCheckpoint(checkpoint: Checkpoint)
 
     /**
-     * Returns an `ACQUIRED` job to `PENDING`, optionally with a re-acquisition deadline. The row is
-     * moved from `job_acquired` to `job_queue` with `available_at = availableAt` (or `0` when
-     * `availableAt` is `null` or `0`). Acquisition will skip the row until `now >= available_at`.
-     *
-     * @param availableAt epoch-millis floor for re-acquisition. `null` is treated as `0` (no
-     *   deadline). Used by SDK sleep to defer re-acquisition until the wake-at moment.
-     * @return a [ReleaseJobResult] classifying success or the precondition failure.
+     * Resets the acquired job's `retries` to 0 — saving a checkpoint counts as forward progress.
      */
-    suspend fun releaseJob(
-        jobId: String,
-        workerId: String,
-        updatedAt: Instant,
-        availableAt: Long?,
-        event: JobEvent,
-    ): ReleaseJobResult
-
-    /**
-     * Bulk-releases every `ACQUIRED` job currently owned by `workerId` back to `PENDING`. The
-     * deadline is **not** preserved — every released row is written with `available_at = 0`. Used
-     * by the dead-worker cleanup path; the SDK's replay flow re-derives any sleep deadline from the
-     * checkpoint chain on the next acquire. `eventFactory` is invoked once per released job and the
-     * resulting events are persisted in the same transaction as the move from `job_acquired` back
-     * into `job_queue`.
-     *
-     * @return the number of jobs released.
-     */
-    suspend fun releaseJobsByWorkerId(
-        workerId: String,
-        updatedAt: Instant,
-        eventFactory: (jobId: String) -> JobEvent,
-    ): Int
-
-    /**
-     * Bulk-releases every `ACQUIRED` job owned by any of the given workers. Same `available_at = 0`
-     * semantics as [releaseJobsByWorkerId]. Used to release jobs for a batch of condemned workers
-     * in one round-trip. `eventFactory` is invoked once per released job and the resulting events
-     * are persisted in the same transaction.
-     *
-     * @return the total number of jobs released.
-     */
-    suspend fun releaseJobsByWorkerIds(
-        workerIds: List<String>,
-        updatedAt: Instant,
-        eventFactory: (jobId: String) -> JobEvent,
-    ): Int
-
-    /**
-     * Inserts a new job and its first event (typically `CREATED`) inside a single transaction so
-     * the audit log is never missing the bookend. Also inserts the matching `job_queue` row with
-     * `available_at = 0`.
-     *
-     * @return an [InsertJobWithEventResult] classifying success or a duplicate-id collision.
-     */
-    suspend fun insertJobWithEvent(newJob: NewJob, event: JobEvent): InsertJobWithEventResult
+    suspend fun resetAcquiredRetries(jobId: String)
 
     /** Returns all events for a job, ordered by `created_at ASC`. */
     suspend fun findEventsByJobId(jobId: String): List<JobEvent>
-}
-
-/** Outcome of [JobGateway.abortJob]. */
-sealed interface AbortJobResult {
-    data class Success(val job: Job) : AbortJobResult
-
-    object NotFound : AbortJobResult
-
-    data class AlreadyTerminal(val status: JobStatus) : AbortJobResult
-}
-
-/** Outcome of [JobGateway.completeJob]. */
-sealed interface CompleteJobResult {
-    data class Success(val job: Job) : CompleteJobResult
-
-    object NotFound : CompleteJobResult
-
-    data class WrongStatus(val status: JobStatus) : CompleteJobResult
-
-    data class WrongWorker(val acquiredBy: String) : CompleteJobResult
-}
-
-/** Outcome of [JobGateway.releaseJob]. */
-sealed interface ReleaseJobResult {
-    data class Success(val job: Job) : ReleaseJobResult
-
-    object NotFound : ReleaseJobResult
-
-    data class WrongStatus(val status: JobStatus) : ReleaseJobResult
-
-    data class WrongWorker(val acquiredBy: String) : ReleaseJobResult
-}
-
-/** Outcome of [JobGateway.reportExecutionError]. */
-sealed interface ReportExecutionErrorResult {
-    data class Success(val job: Job) : ReportExecutionErrorResult
-
-    object NotFound : ReportExecutionErrorResult
-
-    data class WrongStatus(val status: JobStatus) : ReportExecutionErrorResult
-
-    data class WrongWorker(val acquiredBy: String) : ReportExecutionErrorResult
-}
-
-/** Outcome of [JobGateway.insertJobWithEvent]. */
-sealed interface InsertJobWithEventResult {
-    data class Success(val job: Job) : InsertJobWithEventResult
-
-    object AlreadyExists : InsertJobWithEventResult
-}
-
-/** Outcome of [JobGateway.saveCheckpoint]. */
-sealed interface SaveCheckpointResult {
-    data class Success(val checkpoint: Checkpoint) : SaveCheckpointResult
-
-    object NotFound : SaveCheckpointResult
-
-    data class WrongStatus(val status: JobStatus) : SaveCheckpointResult
-
-    data class WrongWorker(val acquiredBy: String) : SaveCheckpointResult
 }

@@ -1,9 +1,11 @@
 package org.zeplinko.logplay.server.core.worker.impl
 
+import java.time.Instant
 import kotlinx.coroutines.test.runTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.zeplinko.logplay.server.core.fakes.InMemoryUnitOfWork
 import org.zeplinko.logplay.server.core.worker.*
 import org.zeplinko.logplay.server.core.worker.fakes.InMemoryWorkerGateway
 
@@ -15,7 +17,7 @@ class RegisterWorkerUseCaseTest {
     @BeforeEach
     fun setUp() {
         workerGateway = InMemoryWorkerGateway()
-        useCase = RegisterWorkerUseCaseImpl(workerGateway)
+        useCase = RegisterWorkerUseCaseImpl(workerGateway, InMemoryUnitOfWork())
     }
 
     // --- Happy path ---
@@ -186,4 +188,58 @@ class RegisterWorkerUseCaseTest {
 
             assertThat(exception).isInstanceOf(WorkerAlreadyRegisteredException::class.java)
         }
+
+    @Test
+    fun `execute reports the existing worker is still active when it is alive`() = runTest {
+        // Freshly registered (recent heartbeat) — the collision is with a live worker.
+        workerGateway.save(aWorker("worker-1", lastHeartbeatAt = Instant.now()))
+
+        val exception =
+            runCatching {
+                    useCase.execute(
+                        RegisterWorkerCommand(
+                            "worker-1",
+                            heartbeatTimeout = 5000,
+                            sessionTimeout = 15000,
+                        )
+                    )
+                }
+                .exceptionOrNull()
+
+        assertThat(exception).isInstanceOf(WorkerAlreadyRegisteredException::class.java)
+        assertThat(exception!!.message).contains("still active")
+    }
+
+    @Test
+    fun `execute reports the existing worker timed out when it is dead`() = runTest {
+        // Last heartbeat far past sessionTimeout — the collision is with a timed-out worker
+        // awaiting cleanup.
+        workerGateway.save(aWorker("worker-1", lastHeartbeatAt = Instant.now().minusSeconds(3600)))
+
+        val exception =
+            runCatching {
+                    useCase.execute(
+                        RegisterWorkerCommand(
+                            "worker-1",
+                            heartbeatTimeout = 5000,
+                            sessionTimeout = 15000,
+                        )
+                    )
+                }
+                .exceptionOrNull()
+
+        assertThat(exception).isInstanceOf(WorkerAlreadyRegisteredException::class.java)
+        assertThat(exception!!.message).contains("timed out")
+    }
+
+    // --- Helpers ---
+
+    private fun aWorker(id: String, lastHeartbeatAt: Instant) =
+        Worker(
+            id = id,
+            heartbeatTimeout = 5000,
+            sessionTimeout = 15000,
+            lastHeartbeatAt = lastHeartbeatAt,
+            registeredAt = Instant.now(),
+        )
 }

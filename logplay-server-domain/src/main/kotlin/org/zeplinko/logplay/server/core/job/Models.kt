@@ -1,6 +1,7 @@
 package org.zeplinko.logplay.server.core.job
 
 import java.time.Instant
+import java.util.UUID
 
 /**
  * The central durable-execution aggregate. A job moves through the [JobStatus] lifecycle, with
@@ -203,13 +204,6 @@ data class ReportExecutionErrorCommand(val jobId: String, val workerId: String, 
 data class AbortJobCommand(val jobId: String)
 
 /**
- * Result returned by the `compute` lambda passed to [JobGateway.reportExecutionError]. Carries the
- * resolved next state, the new retry count, and the events to persist atomically with the state
- * transition.
- */
-data class ExecutionErrorResult(val status: JobStatus, val retries: Int, val events: List<JobEvent>)
-
-/**
  * Immutable audit-log entry. Every state transition appends one (or, for `FAILED`, two) of these.
  *
  * @property actorType `WORKER` for transitions initiated by a worker call, `SYSTEM` for
@@ -227,4 +221,60 @@ data class JobEvent(
     val createdAt: Instant,
     val eventMessage: String?,
     val eventDetail: String?,
-)
+) {
+    companion object {
+        /**
+         * Builds a worker-initiated audit entry ([actorType] = `WORKER`, [actorId] = [workerId]) —
+         * used for transitions a worker call drives (acquire, complete, release, error report).
+         */
+        fun worker(
+            jobId: String,
+            eventType: JobEventType,
+            workerId: String,
+            createdAt: Instant,
+            message: String? = null,
+            detail: String? = null,
+        ): JobEvent =
+            JobEvent(
+                id = UUID.randomUUID().toString(),
+                jobId = jobId,
+                eventType = eventType,
+                actorType = ActorType.WORKER,
+                actorId = workerId,
+                createdAt = createdAt,
+                eventMessage = message,
+                eventDetail = detail,
+            )
+
+        /**
+         * Builds a server-initiated audit entry ([actorType] = `SYSTEM`, [actorId] = `null`) — used
+         * for transitions with no worker actor (creation, abort, failure after max retries,
+         * dead-worker / deregistration reclaim).
+         */
+        fun system(
+            jobId: String,
+            eventType: JobEventType,
+            createdAt: Instant,
+            message: String? = null,
+            detail: String? = null,
+        ): JobEvent =
+            JobEvent(
+                id = UUID.randomUUID().toString(),
+                jobId = jobId,
+                eventType = eventType,
+                actorType = ActorType.SYSTEM,
+                actorId = null,
+                createdAt = createdAt,
+                eventMessage = message,
+                eventDetail = detail,
+            )
+
+        /**
+         * Builds a `RELEASED` / `SYSTEM` audit entry for a job returned to the queue by a
+         * server-initiated reclaim (worker deregistration or dead-worker cleanup). [message]
+         * records the reclaim reason.
+         */
+        fun released(jobId: String, createdAt: Instant, message: String): JobEvent =
+            system(jobId, JobEventType.RELEASED, createdAt, message = message)
+    }
+}

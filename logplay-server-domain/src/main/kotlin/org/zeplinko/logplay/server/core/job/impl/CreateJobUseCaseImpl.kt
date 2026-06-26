@@ -2,9 +2,11 @@ package org.zeplinko.logplay.server.core.job.impl
 
 import java.time.Instant
 import java.util.*
+import org.zeplinko.logplay.server.core.UnitOfWork
 import org.zeplinko.logplay.server.core.job.*
 
-class CreateJobUseCaseImpl(private val jobGateway: JobGateway) : CreateJobUseCase {
+class CreateJobUseCaseImpl(private val jobGateway: JobGateway, private val unitOfWork: UnitOfWork) :
+    CreateJobUseCase {
     companion object {
         const val MAX_GROUP_ID_LENGTH = 64
         const val MAX_NAME_LENGTH = 256
@@ -43,24 +45,37 @@ class CreateJobUseCaseImpl(private val jobGateway: JobGateway) : CreateJobUseCas
                 inputData = createJobCommand.inputData,
                 createdAt = currentTime,
             )
-        val event =
-            JobEvent(
-                id = UUID.randomUUID().toString(),
-                jobId = newJob.id,
-                eventType = JobEventType.CREATED,
-                actorType = ActorType.SYSTEM,
-                actorId = null,
-                createdAt = currentTime,
-                eventMessage = null,
-                eventDetail = null,
+        val event = JobEvent.system(newJob.id, JobEventType.CREATED, currentTime)
+        return try {
+            unitOfWork.transaction {
+                jobGateway.insertJob(newJob)
+                jobGateway.insertEvents(listOf(event))
+                newJob.toPendingJob()
+            }
+        } catch (e: DuplicateJobIdException) {
+            throw DuplicateIdempotencyKeyException(
+                createJobCommand.groupId,
+                createJobCommand.idempotencyKey,
             )
-        return when (val result = jobGateway.insertJobWithEvent(newJob, event)) {
-            is InsertJobWithEventResult.Success -> result.job
-            is InsertJobWithEventResult.AlreadyExists ->
-                throw DuplicateIdempotencyKeyException(
-                    createJobCommand.groupId,
-                    createJobCommand.idempotencyKey,
-                )
         }
     }
+
+    private fun NewJob.toPendingJob(): Job =
+        Job(
+            id = id,
+            groupId = groupId,
+            name = name,
+            type = type,
+            status = JobStatus.PENDING,
+            retries = 0,
+            maxRetries = maxRetries,
+            inputData = inputData,
+            createdAt = createdAt,
+            updatedAt = createdAt,
+            lastAcquiredAt = null,
+            acquiredByWorkerId = null,
+            availableAt = 0L,
+            terminalAt = null,
+            outputData = null,
+        )
 }

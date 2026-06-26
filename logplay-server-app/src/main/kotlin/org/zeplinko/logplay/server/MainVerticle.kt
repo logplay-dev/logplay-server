@@ -11,6 +11,7 @@ import io.vertx.kotlin.coroutines.coAwait
 import io.vertx.kotlin.coroutines.coroutineRouter
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
+import org.zeplinko.logplay.server.core.UnitOfWork
 import org.zeplinko.logplay.server.core.job.*
 import org.zeplinko.logplay.server.core.worker.*
 import org.zeplinko.logplay.server.job.use.case.JobUseCaseLookUp
@@ -21,8 +22,11 @@ import org.zeplinko.logplay.server.web.InvalidRequestBodyException
 import org.zeplinko.logplay.server.worker.use.case.WorkerUseCaseLookUp
 import org.zeplinko.logplay.server.worker.web.WorkerController
 
-class MainVerticle(private val jobGateway: JobGateway, private val workerGateway: WorkerGateway) :
-    CoroutineVerticle() {
+class MainVerticle(
+    private val jobGateway: JobGateway,
+    private val workerGateway: WorkerGateway,
+    private val unitOfWork: UnitOfWork,
+) : CoroutineVerticle() {
 
     private val logger = LoggerFactory.getLogger(MainVerticle::class.java)
 
@@ -34,10 +38,17 @@ class MainVerticle(private val jobGateway: JobGateway, private val workerGateway
     var actualPort: Int = -1
         private set
 
+    /**
+     * Runs a single dead-worker cleanup pass and returns the number of workers affected. The single
+     * entry point for a cleanup pass: the periodic timer ([start]) invokes it, and it is also
+     * public so tests and operators can drive it deterministically instead of waiting for the
+     * timer.
+     */
+    suspend fun runDeadWorkerCleanup(): Int = workerUseCases.cleanupDeadWorkersUseCase.execute()
+
     override suspend fun start() {
-        val condemnPeriodMs = config.getLong("cleanup.condemn.period.ms", 15000L)
-        jobUseCases = JobUseCaseLookUp(jobGateway, workerGateway)
-        workerUseCases = WorkerUseCaseLookUp(workerGateway, jobGateway, condemnPeriodMs)
+        jobUseCases = JobUseCaseLookUp(jobGateway, workerGateway, unitOfWork)
+        workerUseCases = WorkerUseCaseLookUp(workerGateway, jobGateway, unitOfWork)
         jobController = JobController(jobUseCases)
         workerController = WorkerController(workerUseCases)
 
@@ -63,7 +74,7 @@ class MainVerticle(private val jobGateway: JobGateway, private val workerGateway
         vertx.setPeriodic(cleanupIntervalMs) {
             launch {
                 try {
-                    workerUseCases.cleanupDeadWorkersUseCase.execute()
+                    runDeadWorkerCleanup()
                 } catch (e: Exception) {
                     logger.error("Dead worker cleanup failed", e)
                 }
@@ -100,9 +111,6 @@ class MainVerticle(private val jobGateway: JobGateway, private val workerGateway
                 is JobNotFoundException,
                 is CheckpointNotFoundException,
                 is WorkerNotFoundException -> 404 to failure.message
-
-                // 403 — Forbidden
-                is WorkerCondemnedException -> 403 to failure.message
 
                 // 409 — Conflict
                 is DuplicateIdempotencyKeyException,

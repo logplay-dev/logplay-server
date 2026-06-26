@@ -23,7 +23,9 @@ class HeartbeatWorkerUseCaseTest {
 
     @Test
     fun `execute should update lastHeartbeatAt`() = runTest {
-        val originalTime = Instant.ofEpochMilli(1000)
+        // Recent (alive) so the liveness gate admits the heartbeat; still old enough to assert the
+        // update moved it forward.
+        val originalTime = Instant.now().minusMillis(1000)
         val worker = aWorker("worker-1", lastHeartbeatAt = originalTime)
         workerGateway.save(worker)
 
@@ -64,15 +66,16 @@ class HeartbeatWorkerUseCaseTest {
     }
 
     @Test
-    fun `execute should throw WorkerCondemnedException when worker is condemned`() = runTest {
-        val worker = aWorker("condemned-worker").copy(condemned = true)
+    fun `execute should throw WorkerNotFoundException when worker has timed out`() = runTest {
+        // Last heartbeat far enough in the past to exceed sessionTimeout — a timed-out worker
+        // cannot heartbeat back to life and must re-register.
+        val worker = aWorker("dead-worker", lastHeartbeatAt = Instant.now().minusSeconds(3600))
         workerGateway.save(worker)
 
         val exception =
-            runCatching { useCase.execute(HeartbeatWorkerCommand("condemned-worker")) }
-                .exceptionOrNull()
+            runCatching { useCase.execute(HeartbeatWorkerCommand("dead-worker")) }.exceptionOrNull()
 
-        assertThat(exception).isInstanceOf(WorkerCondemnedException::class.java)
+        assertThat(exception).isInstanceOf(WorkerNotFoundException::class.java)
     }
 
     // --- Helpers ---
