@@ -1,6 +1,8 @@
 package org.zeplinko.logplay.server.core.job.impl
 
 import java.time.Instant
+import org.zeplinko.logplay.server.core.Metrics
+import org.zeplinko.logplay.server.core.NoopMetrics
 import org.zeplinko.logplay.server.core.UnitOfWork
 import org.zeplinko.logplay.server.core.job.*
 import org.zeplinko.logplay.server.core.worker.BlankWorkerIdException
@@ -8,6 +10,7 @@ import org.zeplinko.logplay.server.core.worker.BlankWorkerIdException
 class SaveJobCheckpointUseCaseImpl(
     private val jobGateway: JobGateway,
     private val unitOfWork: UnitOfWork,
+    private val metrics: Metrics = NoopMetrics,
 ) : SaveJobCheckpointUseCase {
 
     companion object {
@@ -17,40 +20,43 @@ class SaveJobCheckpointUseCaseImpl(
     override suspend fun execute(command: SaveJobCheckpointCommand): Checkpoint {
         validate(command)
         val now = Instant.now()
-        return unitOfWork.transaction {
-            val job =
-                jobGateway.findAndLockJobById(command.jobId)
-                    ?: throw JobNotFoundException(command.jobId)
-            when (job.status) {
-                JobStatus.ACQUIRED -> Unit
-                JobStatus.PENDING,
-                JobStatus.FINISHED,
-                JobStatus.FAILED,
-                JobStatus.ABORTED -> throw JobNotAcquiredException(command.jobId, job.status)
+        val saved =
+            unitOfWork.transaction {
+                val job =
+                    jobGateway.findAndLockJobById(command.jobId)
+                        ?: throw JobNotFoundException(command.jobId)
+                when (job.status) {
+                    JobStatus.ACQUIRED -> Unit
+                    JobStatus.PENDING,
+                    JobStatus.FINISHED,
+                    JobStatus.FAILED,
+                    JobStatus.ABORTED -> throw JobNotAcquiredException(command.jobId, job.status)
+                }
+                if (job.acquiredByWorkerId != command.workerId)
+                    throw JobNotOwnedByWorkerException(command.jobId, command.workerId)
+                val tail = jobGateway.latestCheckpoint(command.jobId)
+                if (tail?.id != command.previousCheckpointId)
+                    throw InvalidCheckpointOrderException(command.jobId)
+                val checkpoint =
+                    Checkpoint(
+                        id =
+                            CheckpointIdGenerator.fromChainPosition(
+                                command.jobId,
+                                command.previousCheckpointId,
+                            ),
+                        jobId = command.jobId,
+                        previousCheckpointId = command.previousCheckpointId,
+                        name = command.name,
+                        createdAt = now,
+                        orderKey = (tail?.orderKey ?: 0) + 1,
+                        data = command.data,
+                    )
+                jobGateway.insertCheckpoint(checkpoint)
+                jobGateway.resetAcquiredRetries(command.jobId)
+                checkpoint
             }
-            if (job.acquiredByWorkerId != command.workerId)
-                throw JobNotOwnedByWorkerException(command.jobId, command.workerId)
-            val tail = jobGateway.latestCheckpoint(command.jobId)
-            if (tail?.id != command.previousCheckpointId)
-                throw InvalidCheckpointOrderException(command.jobId)
-            val checkpoint =
-                Checkpoint(
-                    id =
-                        CheckpointIdGenerator.fromChainPosition(
-                            command.jobId,
-                            command.previousCheckpointId,
-                        ),
-                    jobId = command.jobId,
-                    previousCheckpointId = command.previousCheckpointId,
-                    name = command.name,
-                    createdAt = now,
-                    orderKey = (tail?.orderKey ?: 0) + 1,
-                    data = command.data,
-                )
-            jobGateway.insertCheckpoint(checkpoint)
-            jobGateway.resetAcquiredRetries(command.jobId)
-            checkpoint
-        }
+        metrics.onCheckpointSaved(command.data?.size ?: 0)
+        return saved
     }
 
     private fun validate(command: SaveJobCheckpointCommand) {

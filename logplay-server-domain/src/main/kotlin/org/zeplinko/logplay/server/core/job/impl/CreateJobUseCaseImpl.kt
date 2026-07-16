@@ -2,11 +2,16 @@ package org.zeplinko.logplay.server.core.job.impl
 
 import java.time.Instant
 import java.util.*
+import org.zeplinko.logplay.server.core.Metrics
+import org.zeplinko.logplay.server.core.NoopMetrics
 import org.zeplinko.logplay.server.core.UnitOfWork
 import org.zeplinko.logplay.server.core.job.*
 
-class CreateJobUseCaseImpl(private val jobGateway: JobGateway, private val unitOfWork: UnitOfWork) :
-    CreateJobUseCase {
+class CreateJobUseCaseImpl(
+    private val jobGateway: JobGateway,
+    private val unitOfWork: UnitOfWork,
+    private val metrics: Metrics = NoopMetrics,
+) : CreateJobUseCase {
     companion object {
         const val MAX_GROUP_ID_LENGTH = 64
         const val MAX_NAME_LENGTH = 256
@@ -47,12 +52,16 @@ class CreateJobUseCaseImpl(private val jobGateway: JobGateway, private val unitO
             )
         val event = JobEvent.system(newJob.id, JobEventType.CREATED, currentTime)
         return try {
-            unitOfWork.transaction {
-                jobGateway.insertJob(newJob)
-                jobGateway.insertEvents(listOf(event))
-                newJob.toPendingJob()
-            }
+            val created =
+                unitOfWork.transaction {
+                    jobGateway.insertJob(newJob)
+                    jobGateway.insertEvents(listOf(event))
+                    newJob.toPendingJob()
+                }
+            metrics.onJobCreated()
+            created
         } catch (e: DuplicateJobIdException) {
+            metrics.onJobDuplicateRejected()
             throw DuplicateIdempotencyKeyException(
                 createJobCommand.groupId,
                 createJobCommand.idempotencyKey,

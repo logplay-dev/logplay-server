@@ -9,6 +9,7 @@ flyway = "11.5.0"
 postgresql = "42.7.5"
 testcontainers = "1.20.4"
 shadow = "9.2.2"
+opentelemetry = "1.45.0"
 
 [libraries]
 # Vert.x (versions managed by BOM)
@@ -26,6 +27,13 @@ jackson-module-kotlin = { module = "com.fasterxml.jackson.module:jackson-module-
 
 # Logging
 log4j-slf4j2-impl = { module = "org.apache.logging.log4j:log4j-slf4j2-impl", version.ref = "log4j" }
+
+# OpenTelemetry (metrics) — versions managed by the BOM
+opentelemetry-bom = { module = "io.opentelemetry:opentelemetry-bom", version.ref = "opentelemetry" }
+opentelemetry-api = { module = "io.opentelemetry:opentelemetry-api" }
+opentelemetry-sdk = { module = "io.opentelemetry:opentelemetry-sdk" }
+opentelemetry-exporter-otlp = { module = "io.opentelemetry:opentelemetry-exporter-otlp" }
+opentelemetry-sdk-autoconfigure = { module = "io.opentelemetry:opentelemetry-sdk-extension-autoconfigure" }
 
 # Testing
 junit-bom = { module = "org.junit:junit-bom", version.ref = "junit-jupiter" }

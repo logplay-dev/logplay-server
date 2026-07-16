@@ -13,11 +13,14 @@ import org.zeplinko.logplay.server.job.adapters.H2WorkerGateway
 private val logger = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass())
 
 fun main() {
+    val config = Config.load()
+    val db = config.db
+
+    // maxConnections gives headroom over the UnitOfWork's confined pool so non-transactional reads
+    // don't block behind a full set of in-flight write transactions.
     val dataSource =
-        JdbcConnectionPool.create("jdbc:h2:file:./logplay-data;AUTO_SERVER=TRUE", "sa", "").apply {
-            // Headroom over the UnitOfWork's confined pool so non-transactional reads don't block
-            // behind a full set of in-flight write transactions.
-            maxConnections = H2UnitOfWork.RECOMMENDED_JDBC_POOL_SIZE
+        JdbcConnectionPool.create(db.jdbcUrl, db.user, db.password).apply {
+            maxConnections = db.poolMaxSize
         }
 
     Flyway.configure().dataSource(dataSource).locations("classpath:db/migration").load().migrate()
@@ -29,6 +32,7 @@ fun main() {
                 H2JobGateway(dataSource),
                 H2WorkerGateway(dataSource),
                 H2UnitOfWork(dataSource),
+                config.app,
             )
         )
         .onFailure { error ->

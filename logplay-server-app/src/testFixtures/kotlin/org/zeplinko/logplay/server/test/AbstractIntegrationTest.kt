@@ -1,6 +1,5 @@
 package org.zeplinko.logplay.server.test
 
-import io.vertx.core.DeploymentOptions
 import io.vertx.core.Vertx
 import io.vertx.core.json.JsonObject
 import io.vertx.ext.web.client.WebClient
@@ -25,6 +24,7 @@ import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.*
 import org.junit.jupiter.api.extension.ExtendWith
 import org.zeplinko.logplay.server.MainVerticle
+import org.zeplinko.logplay.server.config.AppConfig
 import org.zeplinko.logplay.server.core.UnitOfWork
 import org.zeplinko.logplay.server.core.job.JobGateway
 import org.zeplinko.logplay.server.core.job.JobIdGenerator
@@ -76,12 +76,15 @@ abstract class AbstractIntegrationTest {
         jobGateway = jg
         workerGateway = wg
         unitOfWork = backend.createUnitOfWork()
-        verticle = MainVerticle(jobGateway, workerGateway, unitOfWork)
-        val options =
-            DeploymentOptions()
-                .setConfig(JsonObject().put("http.port", 0).put("cleanup.interval.ms", 600000L))
+        verticle =
+            MainVerticle(
+                jobGateway,
+                workerGateway,
+                unitOfWork,
+                AppConfig(httpPort = 0, cleanupIntervalMs = 600_000),
+            )
         vertx
-            .deployVerticle(verticle, options)
+            .deployVerticle(verticle)
             .onComplete(
                 testContext.succeeding {
                     port = verticle.actualPort
