@@ -9,10 +9,8 @@ class HeartbeatWorkerUseCaseImpl(private val workerGateway: WorkerGateway) :
     override suspend fun execute(command: HeartbeatWorkerCommand): Worker {
         if (command.workerId.isBlank()) throw BlankWorkerIdException()
         val now = Instant.now()
-        val updated = workerGateway.updateWorkerHeartbeat(command.workerId, now)
-        if (updated != null) return updated
-        val worker = workerGateway.findWorkerById(command.workerId)
-        if (worker != null && worker.condemned) throw WorkerCondemnedException(command.workerId)
-        throw WorkerNotFoundException(command.workerId)
+        // Liveness-gated: a missing or timed-out worker yields null and must re-register.
+        return workerGateway.updateWorkerHeartbeat(command.workerId, now)
+            ?: throw WorkerNotFoundException(command.workerId)
     }
 }

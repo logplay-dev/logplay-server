@@ -16,7 +16,7 @@ class WorkerController(private val useCases: WorkerUseCaseLookUp) {
     /**
      * Mounts every worker route on `router`. Endpoints registered:
      * - `POST /workers` — register a worker (201)
-     * - `POST /workers/:workerId/heartbeat` — refresh liveness (200; 403 if condemned)
+     * - `POST /workers/:workerId/heartbeat` — refresh liveness (200; 404 if unknown or timed out)
      * - `DELETE /workers/:workerId` — graceful deregister, releasing held jobs (204)
      */
     fun registerRoutes(router: Router, support: CoroutineRouterSupport): Unit =

@@ -16,16 +16,27 @@ class InvalidWorkerIdException(message: String) : WorkerException(message)
 /** No worker exists with the given id. → 404 */
 class WorkerNotFoundException(workerId: String) : WorkerException("Worker not found: $workerId")
 
-/** A worker with the same id is already registered. → 409 */
-class WorkerAlreadyRegisteredException(workerId: String) :
-    WorkerException("Worker already registered: $workerId")
+/**
+ * A worker with the same id is already registered. → 409
+ *
+ * The single-arg form is thrown by the gateway on a primary-key collision, which only knows the id.
+ * The use case enriches it via the [alive] secondary constructor once it has read the existing
+ * row's liveness, so the 409 message tells the caller whether the conflicting worker is still
+ * active or has timed out and is awaiting cleanup.
+ */
+class WorkerAlreadyRegisteredException : WorkerException {
+    constructor(workerId: String) : super("Worker already registered: $workerId")
+
+    constructor(
+        workerId: String,
+        alive: Boolean,
+    ) : super(
+        if (alive) "Worker already registered and still active: $workerId"
+        else
+            "Worker already registered but timed out and pending cleanup: $workerId; " +
+                "register with a new worker id"
+    )
+}
 
 /** `heartbeatTimeout` or `sessionTimeout` violates required ordering or non-positivity. → 400 */
 class InvalidWorkerTimeoutException(message: String) : WorkerException(message)
-
-/**
- * The worker has been condemned (declared dead) by the cleanup pass. Heartbeats and acquisitions
- * are rejected; the row is awaiting deletion in phase 2 of cleanup. → 403
- */
-class WorkerCondemnedException(workerId: String) :
-    WorkerException("Worker $workerId is condemned and pending removal")

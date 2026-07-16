@@ -8,9 +8,8 @@ import java.time.Instant
  * @property id caller-chosen unique identifier.
  * @property heartbeatTimeout expected interval between heartbeats, in ms.
  * @property sessionTimeout time without a heartbeat after which the worker is considered dead, in
- *   ms; required to be greater than [heartbeatTimeout].
- * @property condemned true once the cleanup pass has marked this worker for removal; condemned
- *   workers cannot heartbeat and their jobs are released after a grace period.
+ *   ms; required to be greater than [heartbeatTimeout]. A worker is alive while `now -
+ *   lastHeartbeatAt <= sessionTimeout`; once dead it is reclaimed by cleanup and must re-register.
  */
 data class Worker(
     val id: String,
@@ -18,8 +17,11 @@ data class Worker(
     val sessionTimeout: Long,
     val lastHeartbeatAt: Instant,
     val registeredAt: Instant,
-    val condemned: Boolean = false,
 )
+
+/** True if the worker has not heartbeated within its [Worker.sessionTimeout] as of [now]. */
+fun Worker.isDeadAt(now: Instant): Boolean =
+    now.toEpochMilli() - lastHeartbeatAt.toEpochMilli() > sessionTimeout
 
 /** Input for [RegisterWorkerUseCase]. */
 data class RegisterWorkerCommand(

@@ -6,8 +6,6 @@ import java.sql.ResultSet
 import java.sql.SQLException
 import java.time.Instant
 import javax.sql.DataSource
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import org.zeplinko.logplay.server.core.job.*
 import org.zeplinko.logplay.server.core.worker.WorkerNotFoundException
 
@@ -15,16 +13,21 @@ import org.zeplinko.logplay.server.core.worker.WorkerNotFoundException
  * H2 implementation of [JobGateway] over the three-table state machine (`jobs`, `job_queue`,
  * `job_acquired`).
  *
- * **Serialisation model.** Per-job state transitions ([saveCheckpoint], [reportExecutionError],
- * [completeJob], [abortJob], [releaseJob]) open with `SELECT 1 FROM jobs WHERE id = ? FOR UPDATE`
- * and then perform rowcount-guarded DELETE+INSERT pairs across the secondary tables.
+ * **Serialisation model.** The `jobs` row is the single per-job serialisation point. Per-job
+ * transitions (abort/complete/error/release/checkpoint) take `SELECT ... FOR UPDATE` on it via
+ * [findAndLockJobById] for the lifetime of the enclosing transaction, then compose the primitive
+ * writes across the secondary tables.
  *
- * [acquirePendingJobs] and [releaseJobsByWorkerIds] skip that per-job lock for throughput. They
- * still serialise against per-job transitions through (a) the FK-induced row lock on `jobs`
- * triggered by inserting/deleting `job_acquired` rows, which conflicts with `lockJob`'s `FOR
- * UPDATE`, and (b) row-level locks on the `job_acquired` rows themselves. The FK on
- * `job_acquired.job_id → jobs.id` is therefore load-bearing for correctness and must not be dropped
- * without replacing the lock.
+ * The bulk movers serialise on the same `jobs` lock, but differently. [acquirePendingJobs] uses
+ * `SELECT ... FOR UPDATE SKIP LOCKED` (see [lockJobRowsSkipLocked]) and acts only on the jobs it
+ * locked — a contended job is skipped (it stays queued), so acquire never blocks or deadlocks.
+ * [releaseJobsByWorkerIds] (the dead-worker reaper) instead BLOCKS and drains *every* one of the
+ * worker's jobs (lock them jobs-first with `SELECT id FROM jobs WHERE id IN (…) FOR UPDATE`, then
+ * re-read and move): it must leave no `job_acquired` row before the FK-constrained worker delete,
+ * so it cannot skip; blocking is deadlock-free because worker-lifecycle ops serialise on the
+ * `workers` row and the jobs-first order matches the per-job transitions. NOTE: unlike Postgres,
+ * H2's FK validation takes no conflicting lock on the parent `jobs` row, so the explicit `jobs`
+ * lock is load-bearing for both movers.
  */
 class H2JobGateway(private val dataSource: DataSource) : JobGateway {
 
@@ -93,167 +96,190 @@ class H2JobGateway(private val dataSource: DataSource) : JobGateway {
     private fun SQLException.matchesAnyConstraint(constraints: Set<String>): Boolean =
         constraints.any { matchesConstraint(it) }
 
-    /**
-     * Take the per-job lock that serialises concurrent transitions. Returns `false` if the job does
-     * not exist; callers must short-circuit in that case so they don't write events or
-     * secondary-table rows for a vanished job.
-     */
-    private fun lockJob(conn: Connection, jobId: String): Boolean =
-        conn.prepareStatement("SELECT 1 FROM jobs WHERE id = ? FOR UPDATE").use { stmt ->
-            stmt.setString(1, jobId)
-            stmt.executeQuery().use { rs -> rs.next() }
-        }
-
-    /**
-     * Take the per-job lock and return the full base `jobs` row in a single round-trip. Callers
-     * that mutate the job and want to return an assembled [Job] view use this instead of
-     * [lockJob] + a trailing [readJob], avoiding one round-trip per call. Returns `null` if the job
-     * row does not exist.
-     */
-    private fun lockJobReadingBase(conn: Connection, jobId: String): BaseJobRow? =
-        conn
-            .prepareStatement("SELECT ${JOB_COLUMNS.list()} FROM jobs WHERE id = ? FOR UPDATE")
-            .use { stmt ->
-                stmt.setString(1, jobId)
-                stmt.executeQuery().use { rs -> if (rs.next()) rs.toBaseJob() else null }
-            }
-
     override suspend fun acquirePendingJobs(
         groupId: String,
         type: String,
         workerId: String,
         limit: Int,
-        eventFactory: ((Job) -> JobEvent)?,
     ): List<Job> =
-        withContext(Dispatchers.IO) {
-            dataSource.connection.use { conn ->
-                conn.autoCommit = false
-                try {
-                    val now = Instant.now().toEpochMilli()
-                    // 1) Pick eligible queue rows under SKIP LOCKED. Worker existence + condemned
-                    //    check is folded into the same query so a missing/condemned worker simply
-                    //    returns no rows.
-                    val ready =
-                        conn
-                            .prepareStatement(
-                                """
-                                SELECT q.job_id, q.group_id, q.type, q.enqueued_at, q.retries, q.available_at
-                                FROM job_queue q
-                                INNER JOIN workers w ON w.id = ? AND w.condemned = FALSE
-                                WHERE q.group_id = ? AND q.type = ? AND q.available_at <= ?
-                                ORDER BY q.enqueued_at ASC
-                                LIMIT ?
-                                FOR UPDATE SKIP LOCKED
-                                """
-                                    .trimIndent()
-                            )
-                            .use { stmt ->
-                                stmt.setString(1, workerId)
-                                stmt.setString(2, groupId)
-                                stmt.setString(3, type)
-                                stmt.setLong(4, now)
-                                stmt.setInt(5, limit)
-                                stmt.executeQuery().use { rs ->
-                                    val list = mutableListOf<QueueRow>()
-                                    while (rs.next()) list.add(rs.toQueueRow())
-                                    list
-                                }
-                            }
-                    if (ready.isEmpty()) {
-                        conn.commit()
-                        return@withContext emptyList()
-                    }
-                    // 2) Delete all picked queue rows in one IN-list statement.
-                    val placeholders = ready.joinToString(",") { "?" }
-                    conn
-                        .prepareStatement("DELETE FROM job_queue WHERE job_id IN ($placeholders)")
-                        .use { stmt ->
-                            ready.forEachIndexed { i, r -> stmt.setString(i + 1, r.jobId) }
-                            stmt.executeUpdate()
-                        }
-                    // 3) Insert all corresponding job_acquired rows in one multi-row INSERT.
-                    val rowSql = "(?, ?, ?, ?, ?, ?)"
-                    val multiRowPlaceholders = ready.joinToString(",") { rowSql }
-                    conn
-                        .prepareStatement(
-                            "INSERT INTO job_acquired (job_id, group_id, type, acquired_by_worker_id, acquired_at, retries) VALUES $multiRowPlaceholders"
-                        )
-                        .use { stmt ->
-                            var idx = 1
-                            for (r in ready) {
-                                stmt.setString(idx++, r.jobId)
-                                stmt.setString(idx++, r.groupId)
-                                stmt.setString(idx++, r.type)
-                                stmt.setString(idx++, workerId)
-                                stmt.setLong(idx++, now)
-                                stmt.setInt(idx++, r.retries)
-                            }
-                            stmt.executeUpdate()
-                        }
-                    // 4) Fetch base `jobs` rows in a single round-trip, then assemble the
-                    //    ACQUIRED-shape Job views in memory. Skips the per-job readJob loop —
-                    //    we just inserted into job_acquired ourselves so we already know the
-                    //    workerId/now/retries; only the immutable base columns need a query.
-                    val baseRows = readBaseJobs(conn, ready.map { it.jobId })
-                    val acquiredAt = Instant.ofEpochMilli(now)
-                    val acquiredJobs =
-                        ready.map { r ->
-                            val base =
-                                baseRows[r.jobId]
-                                    ?: error("base jobs row missing for acquired ${r.jobId}")
-                            // Defensive tripwire: the three-table invariant forbids a terminal
-                            // `jobs` row coexisting with a `job_queue` entry. Test coverage
-                            // enforces this for gateway-driven writes, so this only fires if
-                            // the invariant is broken by external means (manual SQL, restored
-                            // backup).
-                            check(base.terminalStatus == null) {
-                                "three-table invariant violated at acquire: job ${r.jobId} has terminal_status=${base.terminalStatus} but was in job_queue"
-                            }
-                            base.toJob(
-                                status = JobStatus.ACQUIRED,
-                                retries = r.retries,
-                                acquiredByWorkerId = workerId,
-                                lastAcquiredAt = acquiredAt,
-                                availableAt = null,
-                                terminalAt = null,
-                                updatedAt = acquiredAt,
-                            )
-                        }
-                    // 6) Bulk-insert events in one round-trip via JDBC batch.
-                    if (eventFactory != null) {
-                        insertEventsBatch(conn, acquiredJobs.map { eventFactory(it) })
-                    }
-                    conn.commit()
-                    acquiredJobs
-                } catch (e: SQLException) {
-                    conn.rollback()
-                    if (e.matchesConstraint(CONSTRAINT_FK_JOB_ACQUIRED_WORKER))
-                        throw WorkerNotFoundException(workerId)
-                    throw e
-                } catch (e: Exception) {
-                    conn.rollback()
-                    throw e
-                } finally {
-                    conn.autoCommit = true
-                }
-            }
+        dataSource.withConn(requireTransaction = true) { conn ->
+            acquireOnConn(conn, groupId, type, workerId, limit, Instant.now().toEpochMilli())
         }
 
-    override suspend fun findJobById(id: String): Job? =
-        withContext(Dispatchers.IO) { dataSource.connection.use { conn -> readJob(conn, id) } }
-
-    override suspend fun findCheckpointById(id: String): Checkpoint? =
-        withContext(Dispatchers.IO) {
-            dataSource.connection.use { conn ->
+    /**
+     * Core SKIP-LOCKED claim backing [acquirePendingJobs]: runs the queue→acquired move on [conn]
+     * and assembles the [Job] views. No event insertion or transaction management — the caller owns
+     * those.
+     */
+    private fun acquireOnConn(
+        conn: Connection,
+        groupId: String,
+        type: String,
+        workerId: String,
+        limit: Int,
+        now: Long,
+    ): List<Job> {
+        try {
+            // 1) Pick eligible queue rows under SKIP LOCKED. The use case has already locked and
+            //    liveness-checked the worker (findAndLockWorkerById), so no worker join is needed.
+            val ready =
                 conn
                     .prepareStatement(
-                        "SELECT ${CHECKPOINT_COLUMNS.list()} FROM checkpoints WHERE id = ?"
+                        """
+                        SELECT q.job_id, q.group_id, q.type, q.enqueued_at, q.retries, q.available_at
+                        FROM job_queue q
+                        WHERE q.group_id = ? AND q.type = ? AND q.available_at <= ?
+                        ORDER BY q.enqueued_at ASC
+                        LIMIT ?
+                        FOR UPDATE SKIP LOCKED
+                        """
+                            .trimIndent()
                     )
                     .use { stmt ->
-                        stmt.setString(1, id)
-                        stmt.executeQuery().use { rs -> if (rs.next()) rs.toCheckpoint() else null }
+                        stmt.setString(1, groupId)
+                        stmt.setString(2, type)
+                        stmt.setLong(3, now)
+                        stmt.setInt(4, limit)
+                        stmt.executeQuery().use { rs ->
+                            val list = mutableListOf<QueueRow>()
+                            while (rs.next()) list.add(rs.toQueueRow())
+                            list
+                        }
                     }
+            if (ready.isEmpty()) return emptyList()
+            // 1b) Lock the jobs rows for the claimed queue entries, skipping any that a concurrent
+            //     per-job transition (abort/complete/error/release) holds via findAndLockJobById's
+            //     `FOR UPDATE`. Only proceed with jobs we locked in BOTH tables — this is what
+            //     serialises bulk acquire against those transitions (H2's FK does not). SKIP LOCKED
+            //     keeps acquire non-blocking, so it can never deadlock against a transition that
+            //     locks jobs-then-queue.
+            val lockedIds = lockJobRowsSkipLocked(conn, ready.map { it.jobId })
+            val claimable = ready.filter { it.jobId in lockedIds }
+            if (claimable.isEmpty()) return emptyList()
+            // 2) Delete all picked queue rows in one IN-list statement.
+            val placeholders = claimable.joinToString(",") { "?" }
+            conn.prepareStatement("DELETE FROM job_queue WHERE job_id IN ($placeholders)").use {
+                stmt ->
+                claimable.forEachIndexed { i, r -> stmt.setString(i + 1, r.jobId) }
+                stmt.executeUpdate()
             }
+            // 3) Insert all corresponding job_acquired rows in one multi-row INSERT.
+            val rowSql = "(?, ?, ?, ?, ?, ?)"
+            val multiRowPlaceholders = claimable.joinToString(",") { rowSql }
+            conn
+                .prepareStatement(
+                    "INSERT INTO job_acquired (job_id, group_id, type, acquired_by_worker_id, acquired_at, retries) VALUES $multiRowPlaceholders"
+                )
+                .use { stmt ->
+                    var idx = 1
+                    for (r in claimable) {
+                        stmt.setString(idx++, r.jobId)
+                        stmt.setString(idx++, r.groupId)
+                        stmt.setString(idx++, r.type)
+                        stmt.setString(idx++, workerId)
+                        stmt.setLong(idx++, now)
+                        stmt.setInt(idx++, r.retries)
+                    }
+                    stmt.executeUpdate()
+                }
+            // 4) Fetch base `jobs` rows in a single round-trip, then assemble the ACQUIRED-shape
+            // Job
+            //    views in memory. Skips the per-job readJob loop — we just inserted into
+            //    job_acquired ourselves so we already know the workerId/now/retries; only the
+            //    immutable base columns need a query.
+            val baseRows = readBaseJobs(conn, claimable.map { it.jobId })
+            val acquiredAt = Instant.ofEpochMilli(now)
+            return claimable.map { r ->
+                val base =
+                    baseRows[r.jobId] ?: error("base jobs row missing for acquired ${r.jobId}")
+                // Defensive tripwire: the three-table invariant forbids a terminal `jobs` row
+                // coexisting with a `job_queue` entry. Test coverage enforces this for
+                // gateway-driven writes, so this only fires if the invariant is broken by external
+                // means (manual SQL, restored backup).
+                check(base.terminalStatus == null) {
+                    "three-table invariant violated at acquire: job ${r.jobId} has terminal_status=${base.terminalStatus} but was in job_queue"
+                }
+                base.toJob(
+                    status = JobStatus.ACQUIRED,
+                    retries = r.retries,
+                    acquiredByWorkerId = workerId,
+                    lastAcquiredAt = acquiredAt,
+                    availableAt = null,
+                    terminalAt = null,
+                    updatedAt = acquiredAt,
+                )
+            }
+        } catch (e: SQLException) {
+            if (e.matchesConstraint(CONSTRAINT_FK_JOB_ACQUIRED_WORKER))
+                throw WorkerNotFoundException(workerId)
+            throw e
+        }
+    }
+
+    /**
+     * Lock the given `jobs` rows with `FOR UPDATE SKIP LOCKED`, returning the ids actually locked.
+     * Bulk movers ([acquirePendingJobs], [releaseJobsByWorkerIds]) call this so they serialise on
+     * the same `jobs` row that per-job transitions take via [findAndLockJobById] — a job currently
+     * locked by an abort/complete/error/release is skipped (left for that transition). Using SKIP
+     * LOCKED (never blocking) is what keeps the bulk movers out of any deadlock cycle with those
+     * transitions, which lock jobs-then-secondary in the opposite order.
+     */
+    private fun lockJobRowsSkipLocked(conn: Connection, jobIds: List<String>): Set<String> {
+        if (jobIds.isEmpty()) return emptySet()
+        val placeholders = jobIds.joinToString(",") { "?" }
+        return conn
+            .prepareStatement(
+                "SELECT id FROM jobs WHERE id IN ($placeholders) FOR UPDATE SKIP LOCKED"
+            )
+            .use { stmt ->
+                jobIds.forEachIndexed { i, id -> stmt.setString(i + 1, id) }
+                stmt.executeQuery().use { rs ->
+                    val locked = mutableSetOf<String>()
+                    while (rs.next()) locked.add(rs.getString("id"))
+                    locked
+                }
+            }
+    }
+
+    override suspend fun findJobById(id: String): Job? =
+        dataSource.withConn { conn -> readJob(conn, id) }
+
+    override suspend fun findAndLockJobById(id: String): Job? =
+        dataSource.withConn(requireTransaction = true) { conn ->
+            // H2 honours FOR UPDATE only on single-table queries, so take the jobs-row lock with an
+            // explicit statement — this is what serialises concurrent per-job transitions (and,
+            // via the FK-induced lock on `jobs`, against acquire). A FOR UPDATE on the assembled
+            // 3-way LEFT JOIN does not lock the row in H2.
+            val locked =
+                conn.prepareStatement("SELECT 1 FROM jobs WHERE id = ? FOR UPDATE").use { stmt ->
+                    stmt.setString(1, id)
+                    stmt.executeQuery().use { it.next() }
+                }
+            if (!locked) null else readJob(conn, id)
+        }
+
+    override suspend fun latestCheckpoint(jobId: String): Checkpoint? =
+        dataSource.withConn { conn ->
+            conn
+                .prepareStatement(
+                    "SELECT ${CHECKPOINT_COLUMNS.list()} FROM checkpoints WHERE job_id = ? ORDER BY order_key DESC LIMIT 1"
+                )
+                .use { stmt ->
+                    stmt.setString(1, jobId)
+                    stmt.executeQuery().use { rs -> if (rs.next()) rs.toCheckpoint() else null }
+                }
+        }
+
+    override suspend fun findCheckpointById(id: String): Checkpoint? =
+        dataSource.withConn { conn ->
+            conn
+                .prepareStatement(
+                    "SELECT ${CHECKPOINT_COLUMNS.list()} FROM checkpoints WHERE id = ?"
+                )
+                .use { stmt ->
+                    stmt.setString(1, id)
+                    stmt.executeQuery().use { rs -> if (rs.next()) rs.toCheckpoint() else null }
+                }
         }
 
     override suspend fun findCheckpointsByJobId(
@@ -261,124 +287,184 @@ class H2JobGateway(private val dataSource: DataSource) : JobGateway {
         afterOrderKey: Long?,
         limit: Int,
     ): List<Checkpoint> =
-        withContext(Dispatchers.IO) {
-            dataSource.connection.use { conn ->
-                if (afterOrderKey != null) {
-                    conn
-                        .prepareStatement(
-                            "SELECT ${CHECKPOINT_COLUMNS.list()} FROM checkpoints WHERE job_id = ? AND order_key > ? ORDER BY order_key ASC LIMIT ?"
-                        )
-                        .use { stmt ->
-                            stmt.setString(1, jobId)
-                            stmt.setLong(2, afterOrderKey)
-                            stmt.setInt(3, limit)
-                            stmt.executeQuery().use { rs -> rs.mapToCheckpoints() }
-                        }
-                } else {
-                    conn
-                        .prepareStatement(
-                            "SELECT ${CHECKPOINT_COLUMNS.list()} FROM checkpoints WHERE job_id = ? ORDER BY order_key ASC LIMIT ?"
-                        )
-                        .use { stmt ->
-                            stmt.setString(1, jobId)
-                            stmt.setInt(2, limit)
-                            stmt.executeQuery().use { rs -> rs.mapToCheckpoints() }
-                        }
-                }
-            }
-        }
-
-    override suspend fun insertJobWithEvent(
-        newJob: NewJob,
-        event: JobEvent,
-    ): InsertJobWithEventResult =
-        withContext(Dispatchers.IO) {
-            dataSource.connection.use { conn ->
-                conn.autoCommit = false
-                try {
-                    // output_data is null for a freshly created job; terminal_status / terminal_at
-                    // are also null until a terminal transition fires.
-                    conn
-                        .prepareStatement(
-                            "INSERT INTO jobs (id, group_id, name, type, max_retries, input_data, output_data, created_at, terminal_status, terminal_at) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL)"
-                        )
-                        .use { stmt ->
-                            stmt.setString(1, newJob.id)
-                            stmt.setString(2, newJob.groupId)
-                            stmt.setString(3, newJob.name)
-                            stmt.setString(4, newJob.type)
-                            stmt.setObject(5, newJob.maxRetries)
-                            stmt.setBytes(6, newJob.inputData)
-                            stmt.setLong(7, newJob.createdAt.toEpochMilli())
-                            stmt.executeUpdate()
-                        }
-                    conn
-                        .prepareStatement(
-                            "INSERT INTO job_queue (job_id, group_id, type, enqueued_at, retries, available_at) VALUES (?, ?, ?, ?, 0, 0)"
-                        )
-                        .use { stmt ->
-                            stmt.setString(1, newJob.id)
-                            stmt.setString(2, newJob.groupId)
-                            stmt.setString(3, newJob.type)
-                            stmt.setLong(4, newJob.createdAt.toEpochMilli())
-                            stmt.executeUpdate()
-                        }
-                    insertEventStatement(conn, event)
-                    conn.commit()
-                    InsertJobWithEventResult.Success(newJob.toPendingJob())
-                } catch (e: SQLException) {
-                    conn.rollback()
-                    if (e.matchesConstraint(CONSTRAINT_JOBS_PK))
-                        InsertJobWithEventResult.AlreadyExists
-                    else throw e
-                } catch (e: Exception) {
-                    conn.rollback()
-                    throw e
-                } finally {
-                    conn.autoCommit = true
-                }
-            }
-        }
-
-    /**
-     * Project a freshly-inserted [NewJob] into its assembled PENDING [Job] view. Mirrors what
-     * `readJob` would synthesise from the just-written `jobs` + `job_queue` rows.
-     */
-    private fun NewJob.toPendingJob(): Job =
-        Job(
-            id = id,
-            groupId = groupId,
-            name = name,
-            type = type,
-            status = JobStatus.PENDING,
-            retries = 0,
-            maxRetries = maxRetries,
-            inputData = inputData,
-            createdAt = createdAt,
-            updatedAt = createdAt,
-            lastAcquiredAt = null,
-            acquiredByWorkerId = null,
-            availableAt = 0L,
-            terminalAt = null,
-            outputData = null,
-        )
-
-    override suspend fun findEventsByJobId(jobId: String): List<JobEvent> =
-        withContext(Dispatchers.IO) {
-            dataSource.connection.use { conn ->
+        dataSource.withConn { conn ->
+            if (afterOrderKey != null) {
                 conn
                     .prepareStatement(
-                        "SELECT ${JOB_EVENT_COLUMNS.list()} FROM job_events WHERE job_id = ? ORDER BY created_at ASC"
+                        "SELECT ${CHECKPOINT_COLUMNS.list()} FROM checkpoints WHERE job_id = ? AND order_key > ? ORDER BY order_key ASC LIMIT ?"
                     )
                     .use { stmt ->
                         stmt.setString(1, jobId)
-                        stmt.executeQuery().use { rs ->
-                            val events = mutableListOf<JobEvent>()
-                            while (rs.next()) events.add(rs.toJobEvent())
-                            events
-                        }
+                        stmt.setLong(2, afterOrderKey)
+                        stmt.setInt(3, limit)
+                        stmt.executeQuery().use { rs -> rs.mapToCheckpoints() }
+                    }
+            } else {
+                conn
+                    .prepareStatement(
+                        "SELECT ${CHECKPOINT_COLUMNS.list()} FROM checkpoints WHERE job_id = ? ORDER BY order_key ASC LIMIT ?"
+                    )
+                    .use { stmt ->
+                        stmt.setString(1, jobId)
+                        stmt.setInt(2, limit)
+                        stmt.executeQuery().use { rs -> rs.mapToCheckpoints() }
                     }
             }
+        }
+
+    override suspend fun insertJob(newJob: NewJob) {
+        dataSource.withConn { conn ->
+            try {
+                conn
+                    .prepareStatement(
+                        "INSERT INTO jobs (id, group_id, name, type, max_retries, input_data, output_data, created_at, terminal_status, terminal_at) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL)"
+                    )
+                    .use { stmt ->
+                        stmt.setString(1, newJob.id)
+                        stmt.setString(2, newJob.groupId)
+                        stmt.setString(3, newJob.name)
+                        stmt.setString(4, newJob.type)
+                        stmt.setObject(5, newJob.maxRetries)
+                        stmt.setBytes(6, newJob.inputData)
+                        stmt.setLong(7, newJob.createdAt.toEpochMilli())
+                        stmt.executeUpdate()
+                    }
+                conn
+                    .prepareStatement(
+                        "INSERT INTO job_queue (job_id, group_id, type, enqueued_at, retries, available_at) VALUES (?, ?, ?, ?, 0, 0)"
+                    )
+                    .use { stmt ->
+                        stmt.setString(1, newJob.id)
+                        stmt.setString(2, newJob.groupId)
+                        stmt.setString(3, newJob.type)
+                        stmt.setLong(4, newJob.createdAt.toEpochMilli())
+                        stmt.executeUpdate()
+                    }
+            } catch (e: SQLException) {
+                if (e.matchesConstraint(CONSTRAINT_JOBS_PK))
+                    throw DuplicateJobIdException(newJob.id, e)
+                throw e
+            }
+        }
+    }
+
+    override suspend fun insertEvents(events: List<JobEvent>) {
+        dataSource.withConn { conn -> insertEventsBatch(conn, events) }
+    }
+
+    override suspend fun removeFromQueue(jobId: String) {
+        dataSource.withConn { conn ->
+            conn.prepareStatement("DELETE FROM job_queue WHERE job_id = ?").use { stmt ->
+                stmt.setString(1, jobId)
+                stmt.executeUpdate()
+            }
+        }
+    }
+
+    override suspend fun removeFromAcquired(jobId: String) {
+        dataSource.withConn { conn ->
+            conn.prepareStatement("DELETE FROM job_acquired WHERE job_id = ?").use { stmt ->
+                stmt.setString(1, jobId)
+                stmt.executeUpdate()
+            }
+        }
+    }
+
+    override suspend fun enqueue(
+        jobId: String,
+        groupId: String,
+        type: String,
+        enqueuedAt: Instant,
+        retries: Int,
+        availableAt: Long,
+    ) {
+        dataSource.withConn { conn ->
+            conn
+                .prepareStatement(
+                    "INSERT INTO job_queue (job_id, group_id, type, enqueued_at, retries, available_at) VALUES (?, ?, ?, ?, ?, ?)"
+                )
+                .use { stmt ->
+                    stmt.setString(1, jobId)
+                    stmt.setString(2, groupId)
+                    stmt.setString(3, type)
+                    stmt.setLong(4, enqueuedAt.toEpochMilli())
+                    stmt.setInt(5, retries)
+                    stmt.setLong(6, availableAt)
+                    stmt.executeUpdate()
+                }
+        }
+    }
+
+    override suspend fun markTerminal(
+        jobId: String,
+        status: JobStatus,
+        terminalAt: Instant,
+        outputData: ByteArray?,
+    ) {
+        dataSource.withConn { conn ->
+            conn
+                .prepareStatement(
+                    "UPDATE jobs SET terminal_status = ?, terminal_at = ?, output_data = ? WHERE id = ?"
+                )
+                .use { stmt ->
+                    stmt.setString(1, status.name)
+                    stmt.setLong(2, terminalAt.toEpochMilli())
+                    stmt.setBytes(3, outputData)
+                    stmt.setString(4, jobId)
+                    stmt.executeUpdate()
+                }
+        }
+    }
+
+    override suspend fun insertCheckpoint(checkpoint: Checkpoint) {
+        dataSource.withConn { conn ->
+            try {
+                conn
+                    .prepareStatement(
+                        "INSERT INTO checkpoints (id, job_id, previous_checkpoint_id, name, created_at, order_key, data) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                    )
+                    .use { stmt ->
+                        stmt.setString(1, checkpoint.id)
+                        stmt.setString(2, checkpoint.jobId)
+                        stmt.setString(3, checkpoint.previousCheckpointId)
+                        stmt.setString(4, checkpoint.name)
+                        stmt.setLong(5, checkpoint.createdAt.toEpochMilli())
+                        stmt.setLong(6, checkpoint.orderKey)
+                        stmt.setBytes(7, checkpoint.data)
+                        stmt.executeUpdate()
+                    }
+            } catch (e: SQLException) {
+                if (e.matchesAnyConstraint(CHECKPOINT_CONSTRAINTS))
+                    throw InvalidCheckpointOrderException(checkpoint.jobId, e)
+                throw e
+            }
+        }
+    }
+
+    override suspend fun resetAcquiredRetries(jobId: String) {
+        dataSource.withConn { conn ->
+            conn.prepareStatement("UPDATE job_acquired SET retries = 0 WHERE job_id = ?").use { stmt
+                ->
+                stmt.setString(1, jobId)
+                stmt.executeUpdate()
+            }
+        }
+    }
+
+    override suspend fun findEventsByJobId(jobId: String): List<JobEvent> =
+        dataSource.withConn { conn ->
+            conn
+                .prepareStatement(
+                    "SELECT ${JOB_EVENT_COLUMNS.list()} FROM job_events WHERE job_id = ? ORDER BY created_at ASC"
+                )
+                .use { stmt ->
+                    stmt.setString(1, jobId)
+                    stmt.executeQuery().use { rs ->
+                        val events = mutableListOf<JobEvent>()
+                        while (rs.next()) events.add(rs.toJobEvent())
+                        events
+                    }
+                }
         }
 
     /** Bind a [JobEvent] to a [PreparedStatement] in the column order of [JOB_EVENT_COLUMNS]. */
@@ -392,9 +478,6 @@ class H2JobGateway(private val dataSource: DataSource) : JobGateway {
         setString(7, event.eventMessage)
         setString(8, event.eventDetail)
     }
-
-    private fun insertEventStatement(conn: Connection, event: JobEvent) =
-        insertEventsBatch(conn, listOf(event))
 
     private fun insertEventsBatch(conn: Connection, events: List<JobEvent>) {
         if (events.isEmpty()) return
@@ -430,553 +513,101 @@ class H2JobGateway(private val dataSource: DataSource) : JobGateway {
             }
     }
 
-    override suspend fun saveCheckpoint(
-        jobId: String,
-        workerId: String,
-        updatedAt: Instant,
-        compute: (Checkpoint?) -> Checkpoint,
-    ): SaveCheckpointResult =
-        withContext(Dispatchers.IO) {
-            dataSource.connection.use { conn ->
-                conn.autoCommit = false
-                try {
-                    // Round-trip 1: lock jobs and pull terminal_status, the acquired owner, and
-                    // the latest checkpoint in one statement. The LEFT JOINs let us classify
-                    // NotFound / WrongStatus / WrongWorker under the same lock that gates the
-                    // write below.
-                    val probe =
-                        conn
-                            .prepareStatement(
-                                """
-                                SELECT j.terminal_status,
-                                       a.acquired_by_worker_id,
-                                       ${CHECKPOINT_COLUMNS.qualified("c")}
-                                FROM jobs j
-                                LEFT JOIN job_acquired a ON a.job_id = j.id
-                                LEFT JOIN checkpoints c
-                                    ON c.job_id = j.id
-                                    AND c.order_key = (SELECT MAX(order_key) FROM checkpoints WHERE job_id = j.id)
-                                WHERE j.id = ?
-                                FOR UPDATE
-                                """
-                                    .trimIndent()
-                            )
-                            .use { stmt ->
-                                stmt.setString(1, jobId)
-                                stmt.executeQuery().use { rs ->
-                                    if (!rs.next()) return@use null
-                                    LeaseProbe(
-                                        terminalStatus = rs.getString("terminal_status"),
-                                        acquiredBy = rs.getString("acquired_by_worker_id"),
-                                        lastCheckpoint =
-                                            if (rs.getString("id") == null) null
-                                            else rs.toCheckpoint(),
-                                    )
-                                }
-                            }
-                    if (probe == null) {
-                        conn.rollback()
-                        return@withContext SaveCheckpointResult.NotFound
-                    }
-                    probe.terminalStatus?.let { status ->
-                        conn.rollback()
-                        return@withContext SaveCheckpointResult.WrongStatus(
-                            JobStatus.valueOf(status)
-                        )
-                    }
-                    if (probe.acquiredBy == null) {
-                        conn.rollback()
-                        return@withContext SaveCheckpointResult.WrongStatus(JobStatus.PENDING)
-                    }
-                    if (probe.acquiredBy != workerId) {
-                        conn.rollback()
-                        return@withContext SaveCheckpointResult.WrongWorker(probe.acquiredBy)
-                    }
-                    val checkpoint = compute(probe.lastCheckpoint)
-                    conn
-                        .prepareStatement(
-                            "INSERT INTO checkpoints (id, job_id, previous_checkpoint_id, name, created_at, order_key, data) VALUES (?, ?, ?, ?, ?, ?, ?)"
-                        )
-                        .use { stmt ->
-                            stmt.setString(1, checkpoint.id)
-                            stmt.setString(2, checkpoint.jobId)
-                            stmt.setString(3, checkpoint.previousCheckpointId)
-                            stmt.setString(4, checkpoint.name)
-                            stmt.setLong(5, checkpoint.createdAt.toEpochMilli())
-                            stmt.setLong(6, checkpoint.orderKey)
-                            stmt.setBytes(7, checkpoint.data)
-                            stmt.executeUpdate()
-                        }
-                    val updated =
-                        conn
-                            .prepareStatement(
-                                "UPDATE job_acquired SET retries = 0 WHERE job_id = ? AND acquired_by_worker_id = ?"
-                            )
-                            .use { stmt ->
-                                stmt.setString(1, jobId)
-                                stmt.setString(2, workerId)
-                                stmt.executeUpdate()
-                            }
-                    if (updated == 0) {
-                        // The lock above gates all per-job transitions; the acquired row we just
-                        // read cannot vanish under it.
-                        conn.rollback()
-                        error("three-table invariant violated: job $jobId acquired row vanished")
-                    }
-                    conn.commit()
-                    SaveCheckpointResult.Success(checkpoint)
-                } catch (e: SQLException) {
-                    conn.rollback()
-                    if (e.matchesAnyConstraint(CHECKPOINT_CONSTRAINTS))
-                        throw InvalidCheckpointOrderException(jobId, e)
-                    throw e
-                } catch (e: Exception) {
-                    conn.rollback()
-                    throw e
-                } finally {
-                    conn.autoCommit = true
-                }
-            }
-        }
-
-    override suspend fun reportExecutionError(
-        jobId: String,
-        workerId: String,
-        updatedAt: Instant,
-        compute: (Job) -> ExecutionErrorResult,
-    ): ReportExecutionErrorResult =
-        withContext(Dispatchers.IO) {
-            dataSource.connection.use { conn ->
-                conn.autoCommit = false
-                try {
-                    // Round-trip 1: lock + assembled-Job read in one statement. compute() needs
-                    // max_retries (jobs) + retries (job_acquired) — both surface from the same
-                    // 3-way LEFT JOIN.
-                    val priorJob = readJob(conn, jobId, lockJobs = true)
-                    if (priorJob == null) {
-                        conn.rollback()
-                        return@withContext ReportExecutionErrorResult.NotFound
-                    }
-                    if (priorJob.status != JobStatus.ACQUIRED) {
-                        conn.rollback()
-                        return@withContext ReportExecutionErrorResult.WrongStatus(priorJob.status)
-                    }
-                    if (priorJob.acquiredByWorkerId != workerId) {
-                        conn.rollback()
-                        return@withContext ReportExecutionErrorResult.WrongWorker(
-                            priorJob.acquiredByWorkerId!!
-                        )
-                    }
-                    val deleted =
-                        conn
-                            .prepareStatement(
-                                "DELETE FROM job_acquired WHERE job_id = ? AND acquired_by_worker_id = ?"
-                            )
-                            .use { stmt ->
-                                stmt.setString(1, jobId)
-                                stmt.setString(2, workerId)
-                                stmt.executeUpdate()
-                            }
-                    if (deleted == 0) {
-                        // The lock above gates all per-job transitions; the acquired row we just
-                        // read cannot vanish under it.
-                        conn.rollback()
-                        error("three-table invariant violated: job $jobId acquired row vanished")
-                    }
-                    val result = compute(priorJob)
-                    val resultJob: Job =
-                        when (result.status) {
-                            JobStatus.PENDING -> {
-                                conn
-                                    .prepareStatement(
-                                        "INSERT INTO job_queue (job_id, group_id, type, enqueued_at, retries, available_at) VALUES (?, ?, ?, ?, ?, 0)"
-                                    )
-                                    .use { stmt ->
-                                        stmt.setString(1, jobId)
-                                        stmt.setString(2, priorJob.groupId)
-                                        stmt.setString(3, priorJob.type)
-                                        stmt.setLong(4, updatedAt.toEpochMilli())
-                                        stmt.setInt(5, result.retries)
-                                        stmt.executeUpdate()
-                                    }
-                                priorJob.copy(
-                                    status = JobStatus.PENDING,
-                                    retries = result.retries,
-                                    acquiredByWorkerId = null,
-                                    lastAcquiredAt = null,
-                                    availableAt = 0L,
-                                    updatedAt = updatedAt,
-                                )
-                            }
-                            JobStatus.FAILED -> {
-                                conn
-                                    .prepareStatement(
-                                        "UPDATE jobs SET terminal_status = ?, terminal_at = ? WHERE id = ?"
-                                    )
-                                    .use { stmt ->
-                                        stmt.setString(1, JobStatus.FAILED.name)
-                                        stmt.setLong(2, updatedAt.toEpochMilli())
-                                        stmt.setString(3, jobId)
-                                        stmt.executeUpdate()
-                                    }
-                                priorJob.copy(
-                                    status = JobStatus.FAILED,
-                                    retries = null,
-                                    acquiredByWorkerId = null,
-                                    lastAcquiredAt = null,
-                                    availableAt = null,
-                                    terminalAt = updatedAt,
-                                    updatedAt = updatedAt,
-                                )
-                            }
-                            else ->
-                                error(
-                                    "reportExecutionError can only resolve to PENDING or FAILED, got ${result.status}"
-                                )
-                        }
-                    insertEventsBatch(conn, result.events)
-                    conn.commit()
-                    ReportExecutionErrorResult.Success(resultJob)
-                } catch (e: Exception) {
-                    conn.rollback()
-                    throw e
-                } finally {
-                    conn.autoCommit = true
-                }
-            }
-        }
-
-    override suspend fun completeJob(
-        jobId: String,
-        workerId: String,
-        outputData: ByteArray?,
-        updatedAt: Instant,
-        event: JobEvent,
-    ): CompleteJobResult =
-        withContext(Dispatchers.IO) {
-            dataSource.connection.use { conn ->
-                conn.autoCommit = false
-                try {
-                    val baseRow =
-                        lockJobReadingBase(conn, jobId)
-                            ?: run {
-                                conn.rollback()
-                                return@withContext CompleteJobResult.NotFound
-                            }
-                    baseRow.terminalStatus?.let { status ->
-                        conn.rollback()
-                        return@withContext CompleteJobResult.WrongStatus(JobStatus.valueOf(status))
-                    }
-                    val deleted =
-                        conn
-                            .prepareStatement(
-                                "DELETE FROM job_acquired WHERE job_id = ? AND acquired_by_worker_id = ?"
-                            )
-                            .use { stmt ->
-                                stmt.setString(1, jobId)
-                                stmt.setString(2, workerId)
-                                stmt.executeUpdate()
-                            }
-                    if (deleted == 0) {
-                        // Cold path: classify the failure under the same lock. If the row exists
-                        // in job_acquired, it's owned by a different worker; otherwise the job is
-                        // PENDING (in job_queue) — terminal was ruled out above.
-                        val acquiredBy =
-                            conn
-                                .prepareStatement(
-                                    "SELECT acquired_by_worker_id FROM job_acquired WHERE job_id = ?"
-                                )
-                                .use { stmt ->
-                                    stmt.setString(1, jobId)
-                                    stmt.executeQuery().use { rs ->
-                                        if (rs.next()) rs.getString(1) else null
-                                    }
-                                }
-                        conn.rollback()
-                        return@withContext if (acquiredBy != null)
-                            CompleteJobResult.WrongWorker(acquiredBy)
-                        else CompleteJobResult.WrongStatus(JobStatus.PENDING)
-                    }
-                    conn
-                        .prepareStatement(
-                            "UPDATE jobs SET terminal_status = ?, terminal_at = ?, output_data = ? WHERE id = ?"
-                        )
-                        .use { stmt ->
-                            stmt.setString(1, JobStatus.FINISHED.name)
-                            stmt.setLong(2, updatedAt.toEpochMilli())
-                            stmt.setBytes(3, outputData)
-                            stmt.setString(4, jobId)
-                            stmt.executeUpdate()
-                        }
-                    insertEventStatement(conn, event)
-                    conn.commit()
-                    CompleteJobResult.Success(
-                        baseRow.toTerminalJob(JobStatus.FINISHED, updatedAt, outputData)
-                    )
-                } catch (e: Exception) {
-                    conn.rollback()
-                    throw e
-                } finally {
-                    conn.autoCommit = true
-                }
-            }
-        }
-
-    override suspend fun abortJob(
-        jobId: String,
-        updatedAt: Instant,
-        event: JobEvent,
-    ): AbortJobResult =
-        withContext(Dispatchers.IO) {
-            dataSource.connection.use { conn ->
-                conn.autoCommit = false
-                try {
-                    val baseRow =
-                        lockJobReadingBase(conn, jobId)
-                            ?: run {
-                                conn.rollback()
-                                return@withContext AbortJobResult.NotFound
-                            }
-                    baseRow.terminalStatus?.let { status ->
-                        conn.rollback()
-                        return@withContext AbortJobResult.AlreadyTerminal(JobStatus.valueOf(status))
-                    }
-                    val queueDeleted =
-                        conn.prepareStatement("DELETE FROM job_queue WHERE job_id = ?").use { stmt
-                            ->
-                            stmt.setString(1, jobId)
-                            stmt.executeUpdate()
-                        }
-                    val acquiredDeleted =
-                        if (queueDeleted == 0) {
-                            conn
-                                .prepareStatement("DELETE FROM job_acquired WHERE job_id = ?")
-                                .use { stmt ->
-                                    stmt.setString(1, jobId)
-                                    stmt.executeUpdate()
-                                }
-                        } else 0
-                    if (queueDeleted == 0 && acquiredDeleted == 0) {
-                        // Non-terminal job (checked above) must live in queue or acquired.
-                        conn.rollback()
-                        error("three-table invariant violated: job $jobId has no state row")
-                    }
-                    conn
-                        .prepareStatement(
-                            "UPDATE jobs SET terminal_status = ?, terminal_at = ? WHERE id = ?"
-                        )
-                        .use { stmt ->
-                            stmt.setString(1, JobStatus.ABORTED.name)
-                            stmt.setLong(2, updatedAt.toEpochMilli())
-                            stmt.setString(3, jobId)
-                            stmt.executeUpdate()
-                        }
-                    insertEventStatement(conn, event)
-                    conn.commit()
-                    AbortJobResult.Success(baseRow.toTerminalJob(JobStatus.ABORTED, updatedAt))
-                } catch (e: Exception) {
-                    conn.rollback()
-                    throw e
-                } finally {
-                    conn.autoCommit = true
-                }
-            }
-        }
-
-    override suspend fun releaseJob(
-        jobId: String,
-        workerId: String,
-        updatedAt: Instant,
-        availableAt: Long?,
-        event: JobEvent,
-    ): ReleaseJobResult =
-        withContext(Dispatchers.IO) {
-            dataSource.connection.use { conn ->
-                conn.autoCommit = false
-                try {
-                    // Lock + read base columns + acquired columns in one LEFT JOIN so we can
-                    // classify NotFound / WrongStatus(terminal) / WrongStatus(PENDING) /
-                    // WrongWorker upfront — single round-trip for the lookup phase.
-                    val probe =
-                        conn
-                            .prepareStatement(
-                                """
-                                SELECT ${JOB_COLUMNS.qualified("j")},
-                                       a.acquired_by_worker_id,
-                                       a.group_id  AS acquired_group_id,
-                                       a.type      AS acquired_type,
-                                       a.retries   AS acquired_retries
-                                FROM jobs j
-                                LEFT JOIN job_acquired a ON a.job_id = j.id
-                                WHERE j.id = ?
-                                FOR UPDATE
-                                """
-                                    .trimIndent()
-                            )
-                            .use { stmt ->
-                                stmt.setString(1, jobId)
-                                stmt.executeQuery().use { rs ->
-                                    if (!rs.next()) return@use null
-                                    rs.toBaseJob() to
-                                        rs.getString("acquired_by_worker_id")?.let { ow ->
-                                            AcquiredOwnership(
-                                                workerId = ow,
-                                                groupId = rs.getString("acquired_group_id"),
-                                                type = rs.getString("acquired_type"),
-                                                retries = rs.getInt("acquired_retries"),
-                                            )
-                                        }
-                                }
-                            }
-                    if (probe == null) {
-                        conn.rollback()
-                        return@withContext ReleaseJobResult.NotFound
-                    }
-                    val (baseRow, acquired) = probe
-                    baseRow.terminalStatus?.let { status ->
-                        conn.rollback()
-                        return@withContext ReleaseJobResult.WrongStatus(JobStatus.valueOf(status))
-                    }
-                    if (acquired == null) {
-                        // Non-terminal job with no acquired row must be PENDING (in job_queue).
-                        conn.rollback()
-                        return@withContext ReleaseJobResult.WrongStatus(JobStatus.PENDING)
-                    }
-                    if (acquired.workerId != workerId) {
-                        conn.rollback()
-                        return@withContext ReleaseJobResult.WrongWorker(acquired.workerId)
-                    }
-                    val effectiveAvailableAt = availableAt ?: 0L
-                    val acquiredGroupId = acquired.groupId
-                    val acquiredType = acquired.type
-                    val acquiredRetries = acquired.retries
-
-                    val deleted =
-                        conn
-                            .prepareStatement(
-                                "DELETE FROM job_acquired WHERE job_id = ? AND acquired_by_worker_id = ?"
-                            )
-                            .use { stmt ->
-                                stmt.setString(1, jobId)
-                                stmt.setString(2, workerId)
-                                stmt.executeUpdate()
-                            }
-                    if (deleted == 0) {
-                        // The lock above gates all per-job transitions; the acquired row we just
-                        // read cannot vanish under it.
-                        conn.rollback()
-                        error("three-table invariant violated: job $jobId acquired row vanished")
-                    }
-                    conn
-                        .prepareStatement(
-                            "INSERT INTO job_queue (job_id, group_id, type, enqueued_at, retries, available_at) VALUES (?, ?, ?, ?, ?, ?)"
-                        )
-                        .use { stmt ->
-                            stmt.setString(1, jobId)
-                            stmt.setString(2, acquiredGroupId)
-                            stmt.setString(3, acquiredType)
-                            stmt.setLong(4, updatedAt.toEpochMilli())
-                            stmt.setInt(5, acquiredRetries)
-                            stmt.setLong(6, effectiveAvailableAt)
-                            stmt.executeUpdate()
-                        }
-                    insertEventStatement(conn, event)
-                    conn.commit()
-                    ReleaseJobResult.Success(
-                        baseRow.toPendingJob(
-                            retries = acquiredRetries,
-                            availableAt = effectiveAvailableAt,
-                            enqueuedAt = updatedAt,
-                        )
-                    )
-                } catch (e: Exception) {
-                    conn.rollback()
-                    throw e
-                } finally {
-                    conn.autoCommit = true
-                }
-            }
-        }
-
-    override suspend fun releaseJobsByWorkerId(
-        workerId: String,
-        updatedAt: Instant,
-        eventFactory: (String) -> JobEvent,
-    ): Int = releaseJobsByWorkerIds(listOf(workerId), updatedAt, eventFactory)
-
     override suspend fun releaseJobsByWorkerIds(
         workerIds: List<String>,
         updatedAt: Instant,
-        eventFactory: (String) -> JobEvent,
-    ): Int =
-        withContext(Dispatchers.IO) {
-            if (workerIds.isEmpty()) return@withContext 0
-            dataSource.connection.use { conn ->
-                conn.autoCommit = false
-                try {
-                    val placeholders = workerIds.joinToString(",") { "?" }
-                    // Snapshot the rows to be released so we can re-insert into job_queue.
-                    val rows =
-                        conn
-                            .prepareStatement(
-                                "SELECT job_id, group_id, type, retries FROM job_acquired WHERE acquired_by_worker_id IN ($placeholders) FOR UPDATE"
-                            )
-                            .use { stmt ->
-                                workerIds.forEachIndexed { i, id -> stmt.setString(i + 1, id) }
-                                stmt.executeQuery().use { rs ->
-                                    val list = mutableListOf<AcquiredRowSnapshot>()
-                                    while (rs.next()) {
-                                        list.add(
-                                            AcquiredRowSnapshot(
-                                                jobId = rs.getString("job_id"),
-                                                groupId = rs.getString("group_id"),
-                                                type = rs.getString("type"),
-                                                retries = rs.getInt("retries"),
-                                            )
-                                        )
-                                    }
-                                    list
-                                }
-                            }
-                    if (rows.isEmpty()) {
-                        conn.commit()
-                        return@withContext 0
-                    }
-                    val jobPlaceholders = rows.joinToString(",") { "?" }
-                    conn
-                        .prepareStatement(
-                            "DELETE FROM job_acquired WHERE job_id IN ($jobPlaceholders)"
-                        )
-                        .use { stmt ->
-                            rows.forEachIndexed { i, r -> stmt.setString(i + 1, r.jobId) }
-                            stmt.executeUpdate()
-                        }
-                    conn
-                        .prepareStatement(
-                            "INSERT INTO job_queue (job_id, group_id, type, enqueued_at, retries, available_at) VALUES (?, ?, ?, ?, ?, 0)"
-                        )
-                        .use { stmt ->
-                            for (r in rows) {
-                                stmt.setString(1, r.jobId)
-                                stmt.setString(2, r.groupId)
-                                stmt.setString(3, r.type)
-                                stmt.setLong(4, updatedAt.toEpochMilli())
-                                stmt.setInt(5, r.retries)
-                                stmt.addBatch()
-                            }
-                            stmt.executeBatch()
-                        }
-                    insertEventsBatch(conn, rows.map { eventFactory(it.jobId) })
-                    conn.commit()
-                    rows.size
-                } catch (e: Exception) {
-                    conn.rollback()
-                    throw e
-                } finally {
-                    conn.autoCommit = true
-                }
-            }
+    ): List<String> =
+        dataSource.withConn(requireTransaction = true) { conn ->
+            releaseOnConn(conn, workerIds, updatedAt)
         }
+
+    /**
+     * Core bulk release backing [releaseJobsByWorkerIds]: atomically moves every `job_acquired` row
+     * owned by [workerIds] back into `job_queue` (with `available_at = 0`) on [conn] and returns
+     * the released job ids. No event insertion or transaction management.
+     */
+    private fun releaseOnConn(
+        conn: Connection,
+        workerIds: List<String>,
+        updatedAt: Instant,
+    ): List<String> {
+        if (workerIds.isEmpty()) return emptyList()
+        val workerPlaceholders = workerIds.joinToString(",") { "?" }
+        // 1) Candidate jobs of these workers (unlocked read). The caller holds the worker-row lock,
+        //    which blocks new acquisitions, so this set only shrinks.
+        val candidateIds =
+            conn
+                .prepareStatement(
+                    "SELECT job_id FROM job_acquired WHERE acquired_by_worker_id IN ($workerPlaceholders)"
+                )
+                .use { stmt ->
+                    workerIds.forEachIndexed { i, id -> stmt.setString(i + 1, id) }
+                    stmt.executeQuery().use { rs ->
+                        val ids = mutableListOf<String>()
+                        while (rs.next()) ids.add(rs.getString(1))
+                        ids
+                    }
+                }
+        if (candidateIds.isEmpty()) return emptyList()
+        // 2) Lock those jobs rows — blocking, single-table, jobs-first. Waits out any in-flight
+        //    per-job transition so we DRAIN every job: skipping a locked job would leave its
+        //    job_acquired row and make the subsequent worker delete violate fk_job_acquired_worker.
+        //    jobs-first + single-table avoids both a lock-order deadlock and a stale read.
+        val jobPlaceholders = candidateIds.joinToString(",") { "?" }
+        conn
+            .prepareStatement("SELECT id FROM jobs WHERE id IN ($jobPlaceholders) FOR UPDATE")
+            .use { stmt ->
+                candidateIds.forEachIndexed { i, id -> stmt.setString(i + 1, id) }
+                stmt.executeQuery().use { rs -> while (rs.next()) {} }
+            }
+        // 3) Fresh re-read of the rows still acquired (now stable under the jobs locks).
+        val rows =
+            conn
+                .prepareStatement(
+                    "SELECT job_id, group_id, type, retries FROM job_acquired WHERE acquired_by_worker_id IN ($workerPlaceholders)"
+                )
+                .use { stmt ->
+                    workerIds.forEachIndexed { i, id -> stmt.setString(i + 1, id) }
+                    stmt.executeQuery().use { rs ->
+                        val list = mutableListOf<AcquiredRowSnapshot>()
+                        while (rs.next()) {
+                            list.add(
+                                AcquiredRowSnapshot(
+                                    jobId = rs.getString("job_id"),
+                                    groupId = rs.getString("group_id"),
+                                    type = rs.getString("type"),
+                                    retries = rs.getInt("retries"),
+                                )
+                            )
+                        }
+                        list
+                    }
+                }
+        if (rows.isEmpty()) return emptyList()
+        // 4) Move every remaining acquired row back to the queue.
+        val movePlaceholders = rows.joinToString(",") { "?" }
+        conn.prepareStatement("DELETE FROM job_acquired WHERE job_id IN ($movePlaceholders)").use {
+            stmt ->
+            rows.forEachIndexed { i, r -> stmt.setString(i + 1, r.jobId) }
+            stmt.executeUpdate()
+        }
+        conn
+            .prepareStatement(
+                "INSERT INTO job_queue (job_id, group_id, type, enqueued_at, retries, available_at) VALUES (?, ?, ?, ?, ?, 0)"
+            )
+            .use { stmt ->
+                for (r in rows) {
+                    stmt.setString(1, r.jobId)
+                    stmt.setString(2, r.groupId)
+                    stmt.setString(3, r.type)
+                    stmt.setLong(4, updatedAt.toEpochMilli())
+                    stmt.setInt(5, r.retries)
+                    stmt.addBatch()
+                }
+                stmt.executeBatch()
+            }
+        return rows.map { it.jobId }
+    }
 
     // --- Read helpers ---
 
@@ -996,27 +627,6 @@ class H2JobGateway(private val dataSource: DataSource) : JobGateway {
         val retries: Int,
     )
 
-    private data class LeaseProbe(
-        val terminalStatus: String?,
-        val acquiredBy: String?,
-        val lastCheckpoint: Checkpoint?,
-    )
-
-    private data class AcquiredOwnership(
-        val workerId: String,
-        val groupId: String,
-        val type: String,
-        val retries: Int,
-    )
-
-    private data class AcquiredRow(
-        val workerId: String,
-        val acquiredAt: Long,
-        val retries: Int,
-        val groupId: String,
-        val type: String,
-    )
-
     private fun ResultSet.toQueueRow(): QueueRow =
         QueueRow(
             jobId = getString("job_id"),
@@ -1027,36 +637,12 @@ class H2JobGateway(private val dataSource: DataSource) : JobGateway {
             availableAt = getLong("available_at"),
         )
 
-    private fun readAcquired(conn: Connection, jobId: String): AcquiredRow? =
-        conn
-            .prepareStatement(
-                "SELECT acquired_by_worker_id, acquired_at, retries, group_id, type FROM job_acquired WHERE job_id = ?"
-            )
-            .use { stmt ->
-                stmt.setString(1, jobId)
-                stmt.executeQuery().use { rs ->
-                    if (rs.next())
-                        AcquiredRow(
-                            workerId = rs.getString("acquired_by_worker_id"),
-                            acquiredAt = rs.getLong("acquired_at"),
-                            retries = rs.getInt("retries"),
-                            groupId = rs.getString("group_id"),
-                            type = rs.getString("type"),
-                        )
-                    else null
-                }
-            }
-
     /**
      * Assemble a denormalised [Job] from the three tables. Returns `null` if `jobs(id)` does not
      * exist; otherwise inspects `terminal_status`, then `job_acquired`, then `job_queue` to derive
      * the live status and per-state fields.
      */
-    private fun readJob(conn: Connection, jobId: String, lockJobs: Boolean = false): Job? {
-        // H2's `FOR UPDATE` locks all base tables touched by the SELECT. For the assembled-Job
-        // read this is acceptable since callers that pass lockJobs=true intend to mutate the
-        // secondary tables in the same transaction anyway.
-        val lockClause = if (lockJobs) "FOR UPDATE" else ""
+    private fun readJob(conn: Connection, jobId: String): Job? {
         return conn
             .prepareStatement(
                 """
@@ -1068,7 +654,6 @@ class H2JobGateway(private val dataSource: DataSource) : JobGateway {
                 LEFT JOIN job_acquired a ON a.job_id = j.id
                 LEFT JOIN job_queue q ON q.job_id = j.id
                 WHERE j.id = ?
-                $lockClause
                 """
                     .trimIndent()
             )
@@ -1171,33 +756,6 @@ class H2JobGateway(private val dataSource: DataSource) : JobGateway {
             availableAt = availableAt,
             terminalAt = terminalAt,
             outputData = outputDataOverride,
-        )
-
-    private fun BaseJobRow.toTerminalJob(
-        status: JobStatus,
-        terminalAt: Instant,
-        outputData: ByteArray? = this.outputData,
-    ): Job =
-        toJob(
-            status = status,
-            retries = null,
-            acquiredByWorkerId = null,
-            lastAcquiredAt = null,
-            availableAt = null,
-            terminalAt = terminalAt,
-            updatedAt = terminalAt,
-            outputDataOverride = outputData,
-        )
-
-    private fun BaseJobRow.toPendingJob(retries: Int, availableAt: Long, enqueuedAt: Instant): Job =
-        toJob(
-            status = JobStatus.PENDING,
-            retries = retries,
-            acquiredByWorkerId = null,
-            lastAcquiredAt = null,
-            availableAt = availableAt,
-            terminalAt = null,
-            updatedAt = enqueuedAt,
         )
 
     private fun ResultSet.toBaseJob(): BaseJobRow {

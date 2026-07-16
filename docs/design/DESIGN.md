@@ -244,13 +244,12 @@ data class Worker(
     val sessionTimeout: Long,            // Max time before worker is considered dead (ms)
     val lastHeartbeatAt: Instant,        // Last received heartbeat
     val registeredAt: Instant,
-    val condemned: Boolean = false,       // Marked for removal (soft delete)
 )
 ```
 
 **Design notes:**
-- `sessionTimeout` must be greater than `heartbeatTimeout`. A worker that hasn't sent a heartbeat within `sessionTimeout` is considered dead.
-- The `condemned` flag enables a two-phase cleanup: mark as condemned first, then release jobs, then delete. This prevents race conditions where a worker sends a heartbeat between job release and deletion.
+- `sessionTimeout` must be greater than `heartbeatTimeout`. A worker is **alive** while `now - lastHeartbeatAt <= sessionTimeout` and **dead** otherwise — there is no intermediate state.
+- There is no soft-delete flag: a dead worker is reclaimed (its jobs released and its row deleted) atomically in a single cleanup pass. Safety against a dead worker acting on a job it no longer owns comes from job-ownership checks on every job transition, not from a worker state flag.
 
 ### 4.4 JobEvent
 
@@ -349,15 +348,15 @@ stateDiagram-v2
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Active : register
+    [*] --> Alive : register
 
-    Active --> Active : heartbeat
-    Active --> Condemned : condemn (dead / deregister)
-
-    Condemned --> Deleted : delete (after condemn period)
+    Alive --> Alive : heartbeat (within sessionTimeout)
+    Alive --> Deleted : deregister / dead-worker cleanup
 
     Deleted --> [*]
 ```
+
+A worker is **alive** while `now - lastHeartbeatAt <= sessionTimeout` and **dead** otherwise — there is no intermediate (condemned/grace) state. The `workers` row is the per-worker serialisation point: deregister and acquire lock it first (`findAndLockWorkerById`), cleanup locks dead rows (`findAndLockDeadWorkers`, `FOR UPDATE SKIP LOCKED`), so concurrent operations on one worker serialise rather than racing a delete against a job acquire/release.
 
 ### Registration
 
@@ -368,24 +367,20 @@ A worker registers with the server providing:
 
 ### Heartbeat Protocol
 
-Workers must periodically send heartbeats to prove liveness. The server updates `lastHeartbeatAt` on each heartbeat. A condemned worker's heartbeat is rejected with a `403 Forbidden` response.
+Workers must periodically send heartbeats to prove liveness. The server refreshes `lastHeartbeatAt` only while the worker is still alive. A worker that has already timed out (`now - lastHeartbeatAt > sessionTimeout`) **cannot heartbeat back to life** — the heartbeat is rejected with `404 Not Found` and the worker must re-register.
 
 ### Deregistration (Explicit)
 
-When a worker explicitly deregisters (e.g., graceful shutdown):
-1. The worker is marked as `condemned`
-2. All jobs acquired by the worker are released back to `PENDING`
-3. The worker record is deleted
+When a worker explicitly deregisters (e.g., graceful shutdown), in one transaction:
+1. Lock the worker row (`findAndLockWorkerById`).
+2. Release all jobs acquired by the worker back to `PENDING` (appending `RELEASED` events).
+3. Delete the worker record.
 
 ### Dead Worker Cleanup (Automatic)
 
-A periodic cleanup task runs every 30 seconds (configurable) and performs a **two-phase cleanup**:
+A periodic cleanup task runs every 30 seconds (configurable) as a **single atomic pass**: lock every dead worker (`now - lastHeartbeatAt > sessionTimeout`) with `FOR UPDATE SKIP LOCKED`, release their acquired jobs back to `PENDING`, and delete the worker rows — all in one transaction.
 
-**Phase 1 - Condemn:** Find all workers where `now - lastHeartbeatAt > sessionTimeout` and `condemned = false`. Mark them as `condemned`.
-
-**Phase 2 - Delete:** Find all workers where `condemned = true` and the condemn period (default 15 seconds) has elapsed. Release all their acquired jobs back to `PENDING`, then delete the worker records.
-
-**Why two phases?** A single-phase approach (detect dead + release jobs + delete) is vulnerable to race conditions: a worker could heartbeat between job release and deletion. The condemn phase ensures a grace period where the worker is locked out (heartbeats return `403`) before its jobs are released.
+**Why single-phase is safe.** The earlier two-phase (condemn → grace → delete) design existed to avoid a worker acting between job release and deletion. That guarantee actually comes from elsewhere: every job transition (`complete`/`release`/`error`/`checkpoint`) checks that the job is still owned by the calling worker, so a reclaimed job is rejected regardless of worker state. Combined with the per-worker row lock (acquire/deregister/cleanup all take it) and the liveness gate on acquire and heartbeat, a single pass reclaims dead workers correctly with no grace period — and `SKIP LOCKED` keeps concurrent cleanup passes and a concurrent deregister from racing on the same worker.
 
 ---
 
@@ -539,7 +534,7 @@ Atomically acquire pending jobs for a worker.
 |-------|----------|---------|-------------|
 | `groupId` | yes | - | Non-blank, max 64 chars |
 | `type` | yes | - | Non-blank, max 512 chars |
-| `workerId` | yes | - | Non-blank, registered, not condemned |
+| `workerId` | yes | - | Non-blank, registered, and alive (not timed out) |
 | `limit` | no | 10 | 1-100 |
 
 **Response (200):** Array of acquired `Job` objects.
@@ -548,7 +543,7 @@ Atomically acquire pending jobs for a worker.
 - Filters by `groupId` AND `type` to scope the acquisition
 - Uses `SELECT ... FOR UPDATE SKIP LOCKED` to prevent contention
 - Orders by `updated_at ASC` (oldest pending jobs first)
-- Validates worker exists and is not condemned before acquiring
+- Locks the worker row and validates the worker exists and is alive (not timed out) before acquiring; a dead or unknown worker yields `404 WorkerNotFoundException`
 - Returns empty array (not an error) if no pending jobs exist
 
 ---
@@ -706,6 +701,8 @@ Send a heartbeat for a registered worker.
 
 **Response (200):** Updated `Worker` object with refreshed `lastHeartbeatAt`.
 
+**Response (404):** `WorkerNotFoundException` if the worker is unknown or has already timed out (`now - lastHeartbeatAt > sessionTimeout`) — a timed-out worker cannot heartbeat back to life and must re-register.
+
 ---
 
 #### DELETE /api/v1/workers/:workerId
@@ -731,8 +728,7 @@ All error responses follow a consistent format:
 | Status | Domain Exceptions |
 |--------|------------------|
 | **400** | `BlankJobTypeException`, `InvalidJobTypeException`, `InvalidJobNameException`, `BlankJobIdException`, `BlankWorkerIdException`, `InvalidWorkerIdException`, `InvalidCheckpointNameException`, `InvalidCheckpointDataException`, `InvalidJobInputDataException`, `InvalidJobOutputDataException`, `InvalidMaxRetriesException`, `BlankIdempotencyKeyException`, `InvalidIdempotencyKeyException`, `InvalidLimitException`, `InvalidWorkerTimeoutException`, `InvalidRequestBodyException`, `InvalidQueryParameterException` |
-| **403** | `WorkerCondemnedException` |
-| **404** | `JobNotFoundException`, `CheckpointNotFoundException`, `WorkerNotFoundException` |
+| **404** | `JobNotFoundException`, `CheckpointNotFoundException`, `WorkerNotFoundException` (also returned when a worker has timed out) |
 | **409** | `DuplicateIdempotencyKeyException`, `JobNotAcquiredException`, `JobNotAbortableException`, `JobNotOwnedByWorkerException`, `JobConcurrentModificationException`, `InvalidCheckpointOrderException`, `WorkerAlreadyRegisteredException` |
 | **500** | All unhandled exceptions (logged with request method and path) |
 
@@ -750,7 +746,6 @@ erDiagram
         BIGINT session_timeout
         BIGINT last_heartbeat_at
         BIGINT registered_at
-        BOOLEAN condemned
     }
 
     jobs {
@@ -850,7 +845,6 @@ Idempotency uniqueness is enforced by the primary key: `jobs.id` is derived dete
 | `session_timeout` | BIGINT | NOT NULL (ms) |
 | `last_heartbeat_at` | BIGINT | NOT NULL (epoch ms) |
 | `registered_at` | BIGINT | NOT NULL (epoch ms) |
-| `condemned` | BOOLEAN | NOT NULL, DEFAULT FALSE |
 
 ### Table: `job_events`
 
@@ -900,7 +894,7 @@ Complex operations use explicit transaction boundaries within gateway implementa
 
 | Operation | Locked Resources | Transaction Scope |
 |-----------|-----------------|-------------------|
-| `acquirePendingJobs` | Job rows (SKIP LOCKED) | SELECT + UPDATE jobs + INSERT events |
+| `acquirePendingJobs` | Worker row (FOR UPDATE) + job rows (SKIP LOCKED) | lock worker + liveness check + SELECT + UPDATE jobs + INSERT events |
 | `saveCheckpoint` | Job row (FOR UPDATE) | SELECT job + SELECT last checkpoint + INSERT checkpoint + UPDATE job |
 | `reportExecutionError` | Job row (FOR UPDATE) | SELECT job + UPDATE job + INSERT event(s) |
 | `completeJob` | Job row (within transaction) | UPDATE job + INSERT event |
@@ -979,7 +973,6 @@ classDiagram
     WorkerException <|-- WorkerNotFoundException
     WorkerException <|-- WorkerAlreadyRegisteredException
     WorkerException <|-- InvalidWorkerTimeoutException
-    WorkerException <|-- WorkerCondemnedException
 
     class JobException {
         <<abstract>>
@@ -1094,7 +1087,6 @@ Integration tests exercise the full stack:
 |----------|------|---------|-------------|
 | `http.port` | Integer | 8080 | HTTP server listen port |
 | `cleanup.interval.ms` | Long | 30000 | Dead worker cleanup interval |
-| `cleanup.condemn.period.ms` | Long | 15000 | Grace period after condemning before deletion |
 
 ### PostgreSQL Environment Variables
 
@@ -1270,7 +1262,7 @@ Maintain an in-process `ConcurrentHashMap<workerId, Instant>` on the app tier. H
 
 - **Complexity:** low. Decorator over `HeartbeatWorkerUseCaseImpl`. No schema change.
 - **Win:** heartbeat write volume drops by roughly the flush-window size (typically 10–100×). Dead-worker detection latency stays bounded by the flush interval.
-- **Caveat:** if an app instance dies mid-window, buffered heartbeats are lost. This is acceptable — the worker sends another heartbeat on its next tick, and the two-phase condemn/delete cleanup already tolerates brief gaps.
+- **Caveat:** if an app instance dies mid-window, buffered heartbeats are lost. This is acceptable — the worker sends another heartbeat on its next tick, and a prematurely reclaimed worker simply re-registers (job-ownership checks keep its in-flight jobs safe).
 
 #### 17.1.b Data retention policy
 

@@ -5,6 +5,7 @@ import kotlinx.coroutines.test.runTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.zeplinko.logplay.server.core.fakes.InMemoryUnitOfWork
 import org.zeplinko.logplay.server.core.job.*
 import org.zeplinko.logplay.server.core.job.fakes.InMemoryJobGateway
 
@@ -16,7 +17,7 @@ class CreateJobUseCaseTest {
     @BeforeEach
     fun setUp() {
         gateway = InMemoryJobGateway()
-        useCase = CreateJobUseCaseImpl(gateway)
+        useCase = CreateJobUseCaseImpl(gateway, InMemoryUnitOfWork())
     }
 
     // --- Happy path ---

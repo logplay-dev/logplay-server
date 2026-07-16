@@ -6,6 +6,7 @@ import kotlinx.coroutines.test.runTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.zeplinko.logplay.server.core.fakes.InMemoryUnitOfWork
 import org.zeplinko.logplay.server.core.job.*
 import org.zeplinko.logplay.server.core.job.fakes.InMemoryJobGateway
 
@@ -17,7 +18,7 @@ class AbortJobUseCaseTest {
     @BeforeEach
     fun setUp() {
         gateway = InMemoryJobGateway()
-        useCase = AbortJobUseCaseImpl(gateway)
+        useCase = AbortJobUseCaseImpl(gateway, InMemoryUnitOfWork())
     }
 
     // --- Happy path ---
@@ -96,7 +97,8 @@ class AbortJobUseCaseTest {
 
                 val exception =
                     runCatching {
-                            AbortJobUseCaseImpl(localGateway).execute(AbortJobCommand(job.id))
+                            AbortJobUseCaseImpl(localGateway, InMemoryUnitOfWork())
+                                .execute(AbortJobCommand(job.id))
                         }
                         .exceptionOrNull()
 

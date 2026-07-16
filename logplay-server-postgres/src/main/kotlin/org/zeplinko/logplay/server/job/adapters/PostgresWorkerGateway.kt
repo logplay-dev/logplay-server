@@ -19,6 +19,7 @@ class PostgresWorkerGateway(private val pool: Pool) : WorkerGateway {
     override suspend fun insertWorker(worker: Worker): Worker {
         try {
             pool
+                .activeClient()
                 .preparedQuery(
                     $$"INSERT INTO workers (id, heartbeat_timeout, session_timeout, last_heartbeat_at, registered_at) VALUES ($1, $2, $3, $4, $5)"
                 )
@@ -43,43 +44,31 @@ class PostgresWorkerGateway(private val pool: Pool) : WorkerGateway {
     override suspend fun updateWorkerHeartbeat(workerId: String, heartbeatAt: Instant): Worker? {
         val rowSet =
             pool
+                .activeClient()
                 .preparedQuery(
-                    $$"UPDATE workers SET last_heartbeat_at = $1 WHERE id = $2 AND condemned = FALSE RETURNING *"
+                    $$"UPDATE workers SET last_heartbeat_at = $1 WHERE id = $2 AND ($3 - last_heartbeat_at) <= session_timeout RETURNING *"
                 )
-                .execute(Tuple.of(heartbeatAt.toEpochMilli(), workerId))
+                .execute(Tuple.of(heartbeatAt.toEpochMilli(), workerId, heartbeatAt.toEpochMilli()))
                 .coAwait()
         return if (rowSet.rowCount() > 0) rowSet.first().toWorker() else null
     }
 
-    override suspend fun findWorkerById(id: String): Worker? {
+    override suspend fun findAndLockWorkerById(id: String): Worker? {
         val rowSet =
             pool
-                .preparedQuery($$"SELECT * FROM workers WHERE id = $1")
+                .activeClient(requireTransaction = true)
+                .preparedQuery($$"SELECT * FROM workers WHERE id = $1 FOR UPDATE")
                 .execute(Tuple.of(id))
                 .coAwait()
         return if (rowSet.rowCount() > 0) rowSet.first().toWorker() else null
     }
 
     override suspend fun deleteWorker(id: String) {
-        pool.preparedQuery($$"DELETE FROM workers WHERE id = $1").execute(Tuple.of(id)).coAwait()
-    }
-
-    override suspend fun condemnWorker(id: String) {
         pool
-            .preparedQuery($$"UPDATE workers SET condemned = TRUE WHERE id = $1")
+            .activeClient()
+            .preparedQuery($$"DELETE FROM workers WHERE id = $1")
             .execute(Tuple.of(id))
             .coAwait()
-    }
-
-    override suspend fun condemnDeadWorkers(now: Instant): Int {
-        val rowSet =
-            pool
-                .preparedQuery(
-                    $$"UPDATE workers SET condemned = TRUE WHERE condemned = FALSE AND ($1 - last_heartbeat_at) > session_timeout"
-                )
-                .execute(Tuple.of(now.toEpochMilli()))
-                .coAwait()
-        return rowSet.rowCount()
     }
 
     override suspend fun deleteWorkers(ids: List<String>) {
@@ -88,18 +77,20 @@ class PostgresWorkerGateway(private val pool: Pool) : WorkerGateway {
         val tuple = Tuple.tuple()
         ids.forEach { tuple.addString(it) }
         pool
+            .activeClient()
             .preparedQuery("DELETE FROM workers WHERE id IN ($placeholders)")
             .execute(tuple)
             .coAwait()
     }
 
-    override suspend fun findCondemnedWorkers(now: Instant, condemnPeriodMs: Long): List<Worker> {
+    override suspend fun findAndLockDeadWorkers(now: Instant): List<Worker> {
         val rowSet =
             pool
+                .activeClient(requireTransaction = true)
                 .preparedQuery(
-                    $$"SELECT * FROM workers WHERE condemned = TRUE AND ($1 - last_heartbeat_at) > (session_timeout + $2)"
+                    $$"SELECT * FROM workers WHERE ($1 - last_heartbeat_at) > session_timeout FOR UPDATE SKIP LOCKED"
                 )
-                .execute(Tuple.of(now.toEpochMilli(), condemnPeriodMs))
+                .execute(Tuple.of(now.toEpochMilli()))
                 .coAwait()
         return rowSet.map { it.toWorker() }
     }
@@ -111,6 +102,5 @@ class PostgresWorkerGateway(private val pool: Pool) : WorkerGateway {
             sessionTimeout = getLong("session_timeout"),
             lastHeartbeatAt = Instant.ofEpochMilli(getLong("last_heartbeat_at")),
             registeredAt = Instant.ofEpochMilli(getLong("registered_at")),
-            condemned = getBoolean("condemned"),
         )
 }

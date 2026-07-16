@@ -1,24 +1,34 @@
 package org.zeplinko.logplay.server.test
 
-import io.vertx.core.DeploymentOptions
 import io.vertx.core.Vertx
 import io.vertx.core.json.JsonObject
 import io.vertx.ext.web.client.WebClient
+import io.vertx.junit5.Timeout
 import io.vertx.junit5.VertxExtension
 import io.vertx.junit5.VertxTestContext
 import io.vertx.kotlin.coroutines.coAwait
 import io.vertx.kotlin.coroutines.dispatcher
+import java.sql.Connection
+import java.time.Instant
 import java.util.Base64
 import java.util.UUID
+import java.util.concurrent.TimeUnit
+import kotlin.time.Duration.Companion.milliseconds
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.*
 import org.junit.jupiter.api.extension.ExtendWith
 import org.zeplinko.logplay.server.MainVerticle
+import org.zeplinko.logplay.server.config.AppConfig
+import org.zeplinko.logplay.server.core.UnitOfWork
+import org.zeplinko.logplay.server.core.job.JobGateway
 import org.zeplinko.logplay.server.core.job.JobIdGenerator
+import org.zeplinko.logplay.server.core.worker.WorkerGateway
 
 @ExtendWith(VertxExtension::class)
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -31,18 +41,50 @@ abstract class AbstractIntegrationTest {
     private lateinit var verticle: MainVerticle
     private var port: Int = -1
 
+    // Exposed for gateway-level tests (e.g. the lock-method transaction guard) that need to call a
+    // gateway or open a transaction directly, bypassing the HTTP layer.
+    private lateinit var jobGateway: JobGateway
+    private lateinit var workerGateway: WorkerGateway
+    private lateinit var unitOfWork: UnitOfWork
+
+    // Iterations for the concurrency stress guards below. Timing-dependent races reproduce only
+    // rarely single-shot, so the looped variants make them reliable. Tunable via the
+    // `logplay.stress.iterations` system property (CI can crank it up for deeper soak runs).
+    private val stressRaceIterations =
+        System.getProperty("logplay.stress.iterations")?.toIntOrNull() ?: 250
+
+    // One reused, autocommit JDBC connection for invariant/consistency assertions. Opening a fresh
+    // connection per check (especially on Postgres) dominates the runtime of the looped stress
+    // tests; these checks are SELECT-only and are called sequentially from the test coroutine.
+    private var assertionConnection: Connection? = null
+
+    private fun assertionConn(): Connection {
+        var c = assertionConnection
+        if (c == null || c.isClosed) {
+            c = backend.getJdbcConnection().also { it.autoCommit = true }
+            assertionConnection = c
+        }
+        return c
+    }
+
     @BeforeAll
     fun setUp(vertx: Vertx, testContext: VertxTestContext) {
         backend = createBackend()
         backend.initDatabase()
 
-        val (jobGateway, workerGateway) = backend.createGateways(vertx)
-        verticle = MainVerticle(jobGateway, workerGateway)
-        val options =
-            DeploymentOptions()
-                .setConfig(JsonObject().put("http.port", 0).put("cleanup.interval.ms", 600000L))
+        val (jg, wg) = backend.createGateways(vertx)
+        jobGateway = jg
+        workerGateway = wg
+        unitOfWork = backend.createUnitOfWork()
+        verticle =
+            MainVerticle(
+                jobGateway,
+                workerGateway,
+                unitOfWork,
+                AppConfig(httpPort = 0, cleanupIntervalMs = 600_000),
+            )
         vertx
-            .deployVerticle(verticle, options)
+            .deployVerticle(verticle)
             .onComplete(
                 testContext.succeeding {
                     port = verticle.actualPort
@@ -71,6 +113,7 @@ abstract class AbstractIntegrationTest {
 
     @AfterAll
     fun tearDown(vertx: Vertx, testContext: VertxTestContext) {
+        assertionConnection?.let { runCatching { it.close() } }
         backend.shutdown()
         vertx.close().onComplete(testContext.succeeding { testContext.completeNow() })
     }
@@ -94,6 +137,47 @@ abstract class AbstractIntegrationTest {
                 assertThat(body.getLong("availableAt")).isEqualTo(0L)
                 assertThat(body.getString("terminalAt")).isNull()
                 assertThat(body.getString("groupId")).isEqualTo("test-group")
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    // Review #3: findAndLock* take a real row lock, which only lives as long as the enclosing
+    // transaction. Called outside one, the lock would be acquired on a throwaway auto-commit
+    // connection and released immediately — a silent no-op race. The gateways guard against this by
+    // requiring an ambient transaction, so these calls must throw outside one and succeed inside.
+    @Test
+    fun `findAndLock methods require an open transaction`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val jobId = createJob("lock-guard", "render").getString("id")
+                val workerId = registerWorker()
+
+                // Outside a transaction: each lock read must fail loudly, not no-op the lock.
+                assertThat(runCatching { jobGateway.findAndLockJobById(jobId) }.exceptionOrNull())
+                    .isInstanceOf(IllegalStateException::class.java)
+                assertThat(
+                        runCatching { workerGateway.findAndLockWorkerById(workerId) }
+                            .exceptionOrNull()
+                    )
+                    .isInstanceOf(IllegalStateException::class.java)
+                assertThat(
+                        runCatching { workerGateway.findAndLockDeadWorkers(Instant.now()) }
+                            .exceptionOrNull()
+                    )
+                    .isInstanceOf(IllegalStateException::class.java)
+
+                // Inside a transaction: the guard does not false-trip and the locks resolve.
+                unitOfWork.transaction {
+                    assertThat(jobGateway.findAndLockJobById(jobId)).isNotNull
+                    assertThat(workerGateway.findAndLockWorkerById(workerId)).isNotNull
+                    workerGateway.findAndLockDeadWorkers(Instant.now())
+                }
                 testContext.completeNow()
             } catch (e: Throwable) {
                 testContext.failNow(e)
@@ -150,6 +234,41 @@ abstract class AbstractIntegrationTest {
                 val workerId = registerWorker()
                 val acquired = acquireJobs(workerId, 5)
                 assertThat(acquired).isEmpty()
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `acquire returns the batch ordered by enqueued_at ascending`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val workerId = registerWorker()
+                // Create jobs in order; they enter job_queue with ascending enqueued_at matching
+                // their (physical) creation order.
+                val jobIds =
+                    (0 until 5).map {
+                        createJob("ord-job-$it", "ordered-acq", idempotencyKey = "ord-$it")
+                            .getString("id")
+                    }
+                // Scramble: rewrite enqueued_at so FIFO order is the REVERSE of creation order
+                // (the last-created job is now the oldest). This decouples enqueued_at order from
+                // the rows' physical/scan order, exposing a backend that returns the acquired batch
+                // in scan order instead of the documented enqueued_at ASC order.
+                jobIds.forEachIndexed { i, id -> setEnqueuedAt(id, (jobIds.size - i).toLong()) }
+                val expectedOrder = jobIds.reversed()
+
+                val acquiredIds =
+                    acquireJobs(workerId, limit = 10, type = "ordered-acq").map {
+                        it.getString("id")
+                    }
+
+                assertThat(acquiredIds).containsExactlyElementsOf(expectedOrder)
                 testContext.completeNow()
             } catch (e: Throwable) {
                 testContext.failNow(e)
@@ -1591,7 +1710,7 @@ abstract class AbstractIntegrationTest {
     }
 
     @Test
-    fun `should return 409 when registering a duplicate worker`(
+    fun `should return 409 noting the existing worker is still active on duplicate registration`(
         vertx: Vertx,
         testContext: VertxTestContext,
     ) {
@@ -1609,6 +1728,35 @@ abstract class AbstractIntegrationTest {
                         )
                         .coAwait()
                 assertThat(response.statusCode()).isEqualTo(409)
+                assertThat(response.bodyAsJsonObject().getString("error")).contains("still active")
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    fun `should return 409 noting the existing worker timed out when re-registering a dead worker id`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                registerWorker("dead-dup-worker")
+                markWorkerDead("dead-dup-worker")
+                val response =
+                    client
+                        .post(port, "localhost", "/api/v1/workers")
+                        .sendJsonObject(
+                            JsonObject()
+                                .put("workerId", "dead-dup-worker")
+                                .put("heartbeatTimeout", 5000)
+                                .put("sessionTimeout", 15000)
+                        )
+                        .coAwait()
+                assertThat(response.statusCode()).isEqualTo(409)
+                assertThat(response.bodyAsJsonObject().getString("error")).contains("timed out")
                 testContext.completeNow()
             } catch (e: Throwable) {
                 testContext.failNow(e)
@@ -2220,64 +2368,60 @@ abstract class AbstractIntegrationTest {
      * set. Any other shape (zero locations, or two locations) is a bug.
      */
     private fun assertThreeTableInvariant(jobId: String) {
-        backend.getJdbcConnection().use { conn ->
-            val inQueue =
-                conn.prepareStatement("SELECT COUNT(*) FROM job_queue WHERE job_id = ?").use { s ->
-                    s.setString(1, jobId)
-                    s.executeQuery().use {
-                        it.next()
-                        it.getInt(1)
-                    }
+        val conn = assertionConn()
+        val inQueue =
+            conn.prepareStatement("SELECT COUNT(*) FROM job_queue WHERE job_id = ?").use { s ->
+                s.setString(1, jobId)
+                s.executeQuery().use {
+                    it.next()
+                    it.getInt(1)
                 }
-            val inAcquired =
-                conn.prepareStatement("SELECT COUNT(*) FROM job_acquired WHERE job_id = ?").use { s
-                    ->
-                    s.setString(1, jobId)
-                    s.executeQuery().use {
-                        it.next()
-                        it.getInt(1)
-                    }
+            }
+        val inAcquired =
+            conn.prepareStatement("SELECT COUNT(*) FROM job_acquired WHERE job_id = ?").use { s ->
+                s.setString(1, jobId)
+                s.executeQuery().use {
+                    it.next()
+                    it.getInt(1)
                 }
-            val terminalStatus =
-                conn.prepareStatement("SELECT terminal_status FROM jobs WHERE id = ?").use { s ->
-                    s.setString(1, jobId)
-                    s.executeQuery().use { if (it.next()) it.getString(1) else null }
-                }
-            val locations = inQueue + inAcquired + (if (terminalStatus != null) 1 else 0)
-            assertThat(locations)
-                .describedAs(
-                    "three-table invariant violated for job $jobId: queue=$inQueue acquired=$inAcquired terminal=$terminalStatus"
-                )
-                .isEqualTo(1)
-        }
+            }
+        val terminalStatus =
+            conn.prepareStatement("SELECT terminal_status FROM jobs WHERE id = ?").use { s ->
+                s.setString(1, jobId)
+                s.executeQuery().use { if (it.next()) it.getString(1) else null }
+            }
+        val locations = inQueue + inAcquired + (if (terminalStatus != null) 1 else 0)
+        assertThat(locations)
+            .describedAs(
+                "three-table invariant violated for job $jobId: queue=$inQueue acquired=$inAcquired terminal=$terminalStatus"
+            )
+            .isEqualTo(1)
     }
 
     private fun readQueueAvailableAt(jobId: String): Long? =
-        backend.getJdbcConnection().use { conn ->
-            conn.prepareStatement("SELECT available_at FROM job_queue WHERE job_id = ?").use { s ->
+        assertionConn()
+            .prepareStatement("SELECT available_at FROM job_queue WHERE job_id = ?")
+            .use { s ->
                 s.setString(1, jobId)
                 s.executeQuery().use { if (it.next()) it.getLong(1) else null }
             }
-        }
 
     private fun assertTerminalConsistency(jobId: String) {
-        backend.getJdbcConnection().use { conn ->
-            conn
-                .prepareStatement("SELECT terminal_status, terminal_at FROM jobs WHERE id = ?")
-                .use { s ->
-                    s.setString(1, jobId)
-                    s.executeQuery().use { rs ->
-                        assertThat(rs.next()).describedAs("job $jobId should exist").isTrue()
-                        val terminalStatus = rs.getString("terminal_status")
-                        val terminalAtRaw = rs.getObject("terminal_at")
-                        assertThat(terminalStatus == null)
-                            .describedAs(
-                                "terminal_status / terminal_at consistency violated for job $jobId: terminal_status=$terminalStatus, terminal_at=$terminalAtRaw"
-                            )
-                            .isEqualTo(terminalAtRaw == null)
-                    }
+        assertionConn()
+            .prepareStatement("SELECT terminal_status, terminal_at FROM jobs WHERE id = ?")
+            .use { s ->
+                s.setString(1, jobId)
+                s.executeQuery().use { rs ->
+                    assertThat(rs.next()).describedAs("job $jobId should exist").isTrue()
+                    val terminalStatus = rs.getString("terminal_status")
+                    val terminalAtRaw = rs.getObject("terminal_at")
+                    assertThat(terminalStatus == null)
+                        .describedAs(
+                            "terminal_status / terminal_at consistency violated for job $jobId: terminal_status=$terminalStatus, terminal_at=$terminalAtRaw"
+                        )
+                        .isEqualTo(terminalAtRaw == null)
                 }
-        }
+            }
     }
 
     @Test
@@ -2539,7 +2683,7 @@ abstract class AbstractIntegrationTest {
     }
 
     @Test
-    fun `condemned-worker reaper writes availableAt = 0 unconditionally`(
+    fun `worker reaper writes availableAt = 0 unconditionally`(
         vertx: Vertx,
         testContext: VertxTestContext,
     ) {
@@ -2547,7 +2691,7 @@ abstract class AbstractIntegrationTest {
             try {
                 val (job, workerId) = createAndAcquireJob()
                 val jobId = job.getString("id")
-                // Deregister the worker: equivalent to the condemned-worker reaper move-back.
+                // Deregister the worker: same job move-back the dead-worker reaper performs.
                 val deregister =
                     client.delete(port, "localhost", "/api/v1/workers/$workerId").send().coAwait()
                 assertThat(deregister.statusCode()).isEqualTo(204)
@@ -2754,6 +2898,746 @@ abstract class AbstractIntegrationTest {
         }
     }
 
+    @Test
+    @Timeout(value = 5, timeUnit = TimeUnit.MINUTES)
+    fun `concurrent abort and release race never violates invariant (stress)`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                // Each iteration uses a fresh group so acquire only ever picks up its own job, even
+                // when a prior iteration's release "won" and left a PENDING job behind.
+                repeat(stressRaceIterations) { i ->
+                    val (job, workerId) = createAndAcquireJob(groupId = "abort-release-stress-$i")
+                    val jobId = job.getString("id")
+                    listOf(
+                            async {
+                                client
+                                    .post(port, "localhost", "/api/v1/jobs/$jobId/abort")
+                                    .send()
+                                    .coAwait()
+                                    .statusCode()
+                            },
+                            async {
+                                client
+                                    .post(port, "localhost", "/api/v1/jobs/$jobId/release")
+                                    .sendJsonObject(JsonObject().put("workerId", workerId))
+                                    .coAwait()
+                                    .statusCode()
+                            },
+                        )
+                        .awaitAll()
+                    assertThreeTableInvariant(jobId)
+                }
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    @Timeout(value = 5, timeUnit = TimeUnit.MINUTES)
+    fun `concurrent complete and release race never violates invariant (stress)`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                repeat(stressRaceIterations) { i ->
+                    val (job, workerId) =
+                        createAndAcquireJob(groupId = "complete-release-stress-$i")
+                    val jobId = job.getString("id")
+                    listOf(
+                            async {
+                                client
+                                    .post(port, "localhost", "/api/v1/jobs/$jobId/complete")
+                                    .sendJsonObject(JsonObject().put("workerId", workerId))
+                                    .coAwait()
+                                    .statusCode()
+                            },
+                            async {
+                                client
+                                    .post(port, "localhost", "/api/v1/jobs/$jobId/release")
+                                    .sendJsonObject(JsonObject().put("workerId", workerId))
+                                    .coAwait()
+                                    .statusCode()
+                            },
+                        )
+                        .awaitAll()
+                    assertThreeTableInvariant(jobId)
+                }
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    @Timeout(value = 5, timeUnit = TimeUnit.MINUTES)
+    fun `concurrent abort and acquire race never violates invariant (stress)`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val workerId = registerWorker()
+                // Each iteration uses a fresh group so acquire only ever picks up its own job.
+                repeat(stressRaceIterations) { i ->
+                    val groupId = "abort-acquire-stress-$i"
+                    val created = createJob(groupId = groupId)
+                    val jobId = created.getString("id")
+                    listOf(
+                            async {
+                                client
+                                    .post(port, "localhost", "/api/v1/jobs/$jobId/abort")
+                                    .send()
+                                    .coAwait()
+                                    .statusCode()
+                            },
+                            async {
+                                runCatching { acquireJobs(workerId, 1, groupId = groupId) }
+                                    .getOrElse { emptyList() }
+                            },
+                        )
+                        .awaitAll()
+                    assertThreeTableInvariant(jobId)
+                }
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    // --- Concurrency race matrix (stress) ---
+    //
+    // Exhaustive pairwise coverage of the mutating job operations that can interleave on the SAME
+    // job: { acquire, complete, release, error, abort, checkpoint, deregister }. Each runs the pair
+    // concurrently for `stressRaceIterations` and asserts the three-table invariant + terminal
+    // consistency after every round. `deregister` exercises the bulk reaper
+    // (`releaseJobsByWorkerIds`)
+    // synchronously — the same code the periodic dead-worker cleanup uses. Pairs whose
+    // preconditions
+    // can never overlap on one job (e.g. acquire vs complete — acquire needs PENDING, complete
+    // needs
+    // ACQUIRED and never enqueues) are intentionally omitted. `abort+release`, `abort+acquire` and
+    // `complete+release` have dedicated stress tests above.
+
+    // -- on a PENDING job --
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - acquire vs acquire never double-acquires`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "acquire-acquire",
+            startAcquired = false,
+            { fireAcquire(it.ownerWorkerId, it.groupId) },
+            { fireAcquire(it.otherWorkerId, it.groupId) },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - abort vs abort never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "abort-abort",
+            startAcquired = false,
+            { fireAbort(it.jobId) },
+            { fireAbort(it.jobId) },
+        )
+
+    // -- on an ACQUIRED job --
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - acquire vs release never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "acquire-release",
+            startAcquired = true,
+            { fireAcquire(it.otherWorkerId, it.groupId) },
+            { fireRelease(it.jobId, it.ownerWorkerId) },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - acquire vs error never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "acquire-error",
+            startAcquired = true,
+            { fireAcquire(it.otherWorkerId, it.groupId) },
+            { fireError(it.jobId, it.ownerWorkerId) },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - acquire vs deregister never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "acquire-deregister",
+            startAcquired = true,
+            { fireAcquire(it.otherWorkerId, it.groupId) },
+            { fireDeregister(it.ownerWorkerId) },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - complete vs abort never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "complete-abort",
+            startAcquired = true,
+            { fireComplete(it.jobId, it.ownerWorkerId) },
+            { fireAbort(it.jobId) },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - complete vs error never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "complete-error",
+            startAcquired = true,
+            { fireComplete(it.jobId, it.ownerWorkerId) },
+            { fireError(it.jobId, it.ownerWorkerId) },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - complete vs deregister never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "complete-deregister",
+            startAcquired = true,
+            { fireComplete(it.jobId, it.ownerWorkerId) },
+            { fireDeregister(it.ownerWorkerId) },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - complete vs checkpoint never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "complete-checkpoint",
+            startAcquired = true,
+            { fireComplete(it.jobId, it.ownerWorkerId) },
+            { fireCheckpoint(it.jobId, it.ownerWorkerId) },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - release vs error never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "release-error",
+            startAcquired = true,
+            { fireRelease(it.jobId, it.ownerWorkerId) },
+            { fireError(it.jobId, it.ownerWorkerId) },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - release vs deregister never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "release-deregister",
+            startAcquired = true,
+            { fireRelease(it.jobId, it.ownerWorkerId) },
+            { fireDeregister(it.ownerWorkerId) },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - release vs checkpoint never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "release-checkpoint",
+            startAcquired = true,
+            { fireRelease(it.jobId, it.ownerWorkerId) },
+            { fireCheckpoint(it.jobId, it.ownerWorkerId) },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - error vs abort never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "error-abort",
+            startAcquired = true,
+            { fireError(it.jobId, it.ownerWorkerId) },
+            { fireAbort(it.jobId) },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - error vs deregister never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "error-deregister",
+            startAcquired = true,
+            { fireError(it.jobId, it.ownerWorkerId) },
+            { fireDeregister(it.ownerWorkerId) },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - error vs checkpoint never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "error-checkpoint",
+            startAcquired = true,
+            { fireError(it.jobId, it.ownerWorkerId) },
+            { fireCheckpoint(it.jobId, it.ownerWorkerId) },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - abort vs deregister never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "abort-deregister",
+            startAcquired = true,
+            { fireAbort(it.jobId) },
+            { fireDeregister(it.ownerWorkerId) },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - abort vs checkpoint never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "abort-checkpoint",
+            startAcquired = true,
+            { fireAbort(it.jobId) },
+            { fireCheckpoint(it.jobId, it.ownerWorkerId) },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - deregister vs checkpoint never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "deregister-checkpoint",
+            startAcquired = true,
+            { fireDeregister(it.ownerWorkerId) },
+            { fireCheckpoint(it.jobId, it.ownerWorkerId) },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - deregister vs deregister never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "deregister-deregister",
+            startAcquired = true,
+            { fireDeregister(it.ownerWorkerId) },
+            { fireDeregister(it.ownerWorkerId) },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - checkpoint vs checkpoint never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressJobRace(
+            vertx,
+            testContext,
+            "checkpoint-checkpoint",
+            startAcquired = true,
+            { fireCheckpoint(it.jobId, it.ownerWorkerId) },
+            { fireCheckpoint(it.jobId, it.ownerWorkerId) },
+        )
+
+    // -- worker-lifecycle eviction races (reaper) on the same worker --
+    //
+    // deregister (client) and the periodic dead-worker cleanup both release the worker's jobs and
+    // delete the worker. Concurrent lifecycle ops on the SAME worker must serialise on the worker
+    // row
+    // (deregister locks it FOR UPDATE; cleanup locks dead rows FOR UPDATE SKIP LOCKED) —
+    // without
+    // that they deadlock on the worker-row vs jobs-row lock order.
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - deregister vs cleanup never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressWorkerEvictionRace(
+            vertx,
+            testContext,
+            "deregister-cleanup",
+            { fireDeregister(it) },
+            { fireCleanup() },
+        )
+
+    @Test
+    @Timeout(value = 10, timeUnit = TimeUnit.MINUTES)
+    fun `stress race - cleanup vs cleanup never violates invariant`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) =
+        stressWorkerEvictionRace(
+            vertx,
+            testContext,
+            "cleanup-cleanup",
+            { fireCleanup() },
+            { fireCleanup() },
+        )
+
+    // -- worker eviction must DRAIN a worker whose job is concurrently locked (no FK violation) --
+    //
+    // The reaper must fully release every one of the worker's jobs before the FK-constrained worker
+    // delete. If a job's `jobs` row is held by an in-flight transition (e.g. a checkpoint, which
+    // keeps the job_acquired row), the reaper must block and drain it — not skip it and then
+    // violate
+    // fk_job_acquired_worker on deleteWorker(s). These tests hold the lock from a side connection,
+    // run the eviction, release, and assert it SUCCEEDS (and the job is released, worker gone).
+
+    @Test
+    @Timeout(value = 2, timeUnit = TimeUnit.MINUTES)
+    fun `deregister drains a worker whose job is concurrently locked`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val (job, workerId) = createAndAcquireJob()
+                val jobId = job.getString("id")
+                val status =
+                    evictWhileJobLocked(jobId) {
+                        client
+                            .delete(port, "localhost", "/api/v1/workers/$workerId")
+                            .send()
+                            .coAwait()
+                            .statusCode()
+                    }
+                assertThat(status)
+                    .describedAs(
+                        "deregister should block on the locked job, drain it, and delete the worker"
+                    )
+                    .isEqualTo(204)
+                assertThreeTableInvariant(jobId)
+                assertThat(readQueueAvailableAt(jobId))
+                    .describedAs("job should be released back to the queue")
+                    .isNotNull()
+                assertThat(workerExists(workerId)).describedAs("worker should be deleted").isFalse()
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    @Test
+    @Timeout(value = 2, timeUnit = TimeUnit.MINUTES)
+    fun `cleanup drains a dead worker whose job is concurrently locked`(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val (job, workerId) = createAndAcquireJob()
+                val jobId = job.getString("id")
+                markWorkerDead(workerId)
+                evictWhileJobLocked(jobId) { verticle.runDeadWorkerCleanup() }
+                assertThreeTableInvariant(jobId)
+                assertThat(readQueueAvailableAt(jobId))
+                    .describedAs("job should be released back to the queue")
+                    .isNotNull()
+                assertThat(workerExists(workerId)).describedAs("worker should be evicted").isFalse()
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    /**
+     * Holds a `FOR UPDATE` lock on [jobId]'s `jobs` row from a side connection (simulating an
+     * in-flight transition that keeps the `job_acquired` row), runs [eviction] concurrently, then
+     * releases the lock so a correctly-blocking eviction can drain and complete. Returns whatever
+     * [eviction] produced.
+     */
+    private suspend fun <T> evictWhileJobLocked(jobId: String, eviction: suspend () -> T): T {
+        val holder = backend.getJdbcConnection().also { it.autoCommit = false }
+        return try {
+            holder.prepareStatement("SELECT 1 FROM jobs WHERE id = ? FOR UPDATE").use { st ->
+                st.setString(1, jobId)
+                st.executeQuery().use { it.next() }
+            }
+            coroutineScope {
+                val running = async { eviction() }
+                // Give the eviction time to reach (and block on) the locked job, then release it.
+                delay(500.milliseconds)
+                holder.rollback()
+                running.await()
+            }
+        } finally {
+            runCatching { holder.rollback() }
+            holder.close()
+        }
+    }
+
+    private fun workerExists(workerId: String): Boolean =
+        assertionConn().prepareStatement("SELECT 1 FROM workers WHERE id = ?").use { s ->
+            s.setString(1, workerId)
+            s.executeQuery().use { it.next() }
+        }
+
+    /**
+     * Context handed to each race operation: the job under test plus the workers/group to act as.
+     */
+    private data class RaceCtx(
+        val jobId: String,
+        val ownerWorkerId: String,
+        val otherWorkerId: String,
+        val groupId: String,
+    )
+
+    /**
+     * Runs [opA] and [opB] concurrently against the same job for [stressRaceIterations] rounds,
+     * asserting the three-table invariant and terminal consistency after each. Each round gets a
+     * fresh group (so acquire only ever sees its own job) and a fresh owner worker (so `deregister`
+     * ops, which delete the worker, don't poison later rounds); a single shared "other" worker
+     * plays the second actor for two-worker races. Operations fire-and-tolerate — a race loser
+     * legitimately gets a 4xx; only the resulting state is asserted.
+     */
+    private fun stressJobRace(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+        label: String,
+        startAcquired: Boolean,
+        opA: suspend (RaceCtx) -> Unit,
+        opB: suspend (RaceCtx) -> Unit,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                val otherWorker = registerWorker()
+                repeat(stressRaceIterations) { i ->
+                    val groupId = "$label-$i"
+                    val owner = registerWorker()
+                    val jobId = createJob(groupId = groupId).getString("id")
+                    if (startAcquired) acquireJobs(owner, 1, groupId = groupId)
+                    val ctx = RaceCtx(jobId, owner, otherWorker, groupId)
+                    listOf(async { runCatching { opA(ctx) } }, async { runCatching { opB(ctx) } })
+                        .awaitAll()
+                    assertThreeTableInvariant(jobId)
+                    assertTerminalConsistency(jobId)
+                }
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    // Fire-and-ignore-status variants of the operations, for use inside races (a race loser may get
+    // a 4xx; the runner asserts the resulting state, not the status code).
+    private suspend fun fireAcquire(workerId: String, groupId: String) {
+        client
+            .post(port, "localhost", "/api/v1/jobs/acquire")
+            .sendJsonObject(
+                JsonObject()
+                    .put("workerId", workerId)
+                    .put("limit", 1)
+                    .put("groupId", groupId)
+                    .put("type", "render")
+            )
+            .coAwait()
+    }
+
+    private suspend fun fireComplete(jobId: String, workerId: String) {
+        client
+            .post(port, "localhost", "/api/v1/jobs/$jobId/complete")
+            .sendJsonObject(JsonObject().put("workerId", workerId))
+            .coAwait()
+    }
+
+    private suspend fun fireRelease(jobId: String, workerId: String) {
+        client
+            .post(port, "localhost", "/api/v1/jobs/$jobId/release")
+            .sendJsonObject(JsonObject().put("workerId", workerId))
+            .coAwait()
+    }
+
+    private suspend fun fireError(jobId: String, workerId: String) {
+        client
+            .post(port, "localhost", "/api/v1/jobs/$jobId/error")
+            .sendJsonObject(JsonObject().put("workerId", workerId))
+            .coAwait()
+    }
+
+    private suspend fun fireAbort(jobId: String) {
+        client.post(port, "localhost", "/api/v1/jobs/$jobId/abort").send().coAwait()
+    }
+
+    private suspend fun fireCheckpoint(jobId: String, workerId: String) {
+        client
+            .post(port, "localhost", "/api/v1/jobs/$jobId/checkpoints")
+            .sendJsonObject(
+                JsonObject()
+                    .put("workerId", workerId)
+                    .put("name", "cp")
+                    .put("data", Base64.getEncoder().encodeToString("d".toByteArray()))
+            )
+            .coAwait()
+    }
+
+    private suspend fun fireDeregister(workerId: String) {
+        client.delete(port, "localhost", "/api/v1/workers/$workerId").send().coAwait()
+    }
+
+    private suspend fun fireCleanup() {
+        verticle.runDeadWorkerCleanup()
+    }
+
+    /**
+     * Drives concurrent worker-lifecycle eviction on the SAME worker: each round acquires a job,
+     * then marks the worker dead (so the dead-worker cleanup will reclaim it), then races
+     * [opA]/[opB] (each a deregister or a cleanup pass). Whoever wins releases the job back to the
+     * queue; the loser skips (cleanup) or 404s (deregister). Asserts the three-table invariant
+     * holds (no deadlock, no dual state) every round.
+     */
+    private fun stressWorkerEvictionRace(
+        vertx: Vertx,
+        testContext: VertxTestContext,
+        label: String,
+        opA: suspend (workerId: String) -> Unit,
+        opB: suspend (workerId: String) -> Unit,
+    ) {
+        CoroutineScope(vertx.dispatcher()).launch {
+            try {
+                repeat(stressRaceIterations) { i ->
+                    val groupId = "$label-$i"
+                    val worker = registerWorker()
+                    val jobId = createJob(groupId = groupId).getString("id")
+                    acquireJobs(worker, 1, groupId = groupId)
+                    markWorkerDead(worker)
+                    listOf(
+                            async { runCatching { opA(worker) } },
+                            async { runCatching { opB(worker) } },
+                        )
+                        .awaitAll()
+                    assertThreeTableInvariant(jobId)
+                    assertTerminalConsistency(jobId)
+                }
+                testContext.completeNow()
+            } catch (e: Throwable) {
+                testContext.failNow(e)
+            }
+        }
+    }
+
+    /**
+     * Backdates a worker's heartbeat so it is past its `sessionTimeout` — i.e. dead — making it
+     * eligible for the dead-worker cleanup ([WorkerGateway.findAndLockDeadWorkers]).
+     */
+    private fun markWorkerDead(workerId: String) {
+        assertionConn()
+            .prepareStatement("UPDATE workers SET last_heartbeat_at = 0 WHERE id = ?")
+            .use { s ->
+                s.setString(1, workerId)
+                s.executeUpdate()
+            }
+    }
+
+    /**
+     * Overwrites a queued job's `enqueued_at` so a test can control FIFO order independently of the
+     * order the jobs were created (and of the rows' physical/scan order).
+     */
+    private fun setEnqueuedAt(jobId: String, enqueuedAt: Long) {
+        assertionConn()
+            .prepareStatement("UPDATE job_queue SET enqueued_at = ? WHERE job_id = ?")
+            .use { s ->
+                s.setLong(1, enqueuedAt)
+                s.setString(2, jobId)
+                s.executeUpdate()
+            }
+    }
+
     // --- Helpers ---
 
     private suspend fun registerWorker(workerId: String = UUID.randomUUID().toString()): String {
@@ -2764,7 +3648,9 @@ abstract class AbstractIntegrationTest {
                     JsonObject()
                         .put("workerId", workerId)
                         .put("heartbeatTimeout", 5000)
-                        .put("sessionTimeout", 15000)
+                        // Long session so a worker stays alive across a whole (multi-second) test
+                        // without heartbeating; tests that need a dead worker use markWorkerDead().
+                        .put("sessionTimeout", 3_600_000)
                 )
                 .coAwait()
         assertThat(response.statusCode()).isEqualTo(201)

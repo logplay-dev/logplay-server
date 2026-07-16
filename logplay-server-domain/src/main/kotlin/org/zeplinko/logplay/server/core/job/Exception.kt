@@ -36,6 +36,17 @@ class InvalidCheckpointNameException(message: String) : JobException(message)
 class DuplicateIdempotencyKeyException(groupId: String, idempotencyKey: String) :
     JobException("Job with idempotency key '$idempotencyKey' already exists in group '$groupId'")
 
+/**
+ * A job row with the same primary key (the deterministic id derived from `(groupId,
+ * idempotencyKey)`) already exists. Raised by the `insertJob` gateway primitive on a primary-key
+ * collision — the gateway knows only the id, not the originating idempotency key.
+ * [CreateJobUseCase] catches this inside its transaction and rethrows the richer
+ * [DuplicateIdempotencyKeyException] (which carries the group and key it has on hand), so this type
+ * is an internal gateway→use-case signal and is not normally surfaced to the HTTP layer.
+ */
+class DuplicateJobIdException(jobId: String, cause: Throwable? = null) :
+    JobException("Job with id '$jobId' already exists", cause)
+
 /** Required `idempotencyKey` was missing or blank. → 400 */
 class BlankIdempotencyKeyException : JobException("Idempotency key cannot be blank")
 

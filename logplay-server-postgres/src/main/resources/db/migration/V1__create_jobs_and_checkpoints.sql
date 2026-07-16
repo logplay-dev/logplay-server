@@ -20,8 +20,7 @@ CREATE TABLE workers (
     heartbeat_timeout BIGINT NOT NULL,
     session_timeout BIGINT NOT NULL,
     last_heartbeat_at BIGINT NOT NULL,
-    registered_at BIGINT NOT NULL,
-    condemned BOOLEAN NOT NULL DEFAULT FALSE
+    registered_at BIGINT NOT NULL
 );
 
 -- PENDING references; rows here are time-gated by available_at and ordered by enqueued_at.

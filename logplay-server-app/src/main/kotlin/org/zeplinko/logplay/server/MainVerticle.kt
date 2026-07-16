@@ -11,18 +11,29 @@ import io.vertx.kotlin.coroutines.coAwait
 import io.vertx.kotlin.coroutines.coroutineRouter
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
+import org.zeplinko.logplay.server.config.AppConfig
+import org.zeplinko.logplay.server.core.Metrics
+import org.zeplinko.logplay.server.core.NoopMetrics
+import org.zeplinko.logplay.server.core.UnitOfWork
 import org.zeplinko.logplay.server.core.job.*
 import org.zeplinko.logplay.server.core.worker.*
 import org.zeplinko.logplay.server.job.use.case.JobUseCaseLookUp
 import org.zeplinko.logplay.server.job.web.JobController
+import org.zeplinko.logplay.server.telemetry.HttpMetrics
+import org.zeplinko.logplay.server.telemetry.OtelMetrics
+import org.zeplinko.logplay.server.telemetry.Telemetry
 import org.zeplinko.logplay.server.web.ErrorResponse
 import org.zeplinko.logplay.server.web.InvalidQueryParameterException
 import org.zeplinko.logplay.server.web.InvalidRequestBodyException
 import org.zeplinko.logplay.server.worker.use.case.WorkerUseCaseLookUp
 import org.zeplinko.logplay.server.worker.web.WorkerController
 
-class MainVerticle(private val jobGateway: JobGateway, private val workerGateway: WorkerGateway) :
-    CoroutineVerticle() {
+class MainVerticle(
+    private val jobGateway: JobGateway,
+    private val workerGateway: WorkerGateway,
+    private val unitOfWork: UnitOfWork,
+    private val appConfig: AppConfig,
+) : CoroutineVerticle() {
 
     private val logger = LoggerFactory.getLogger(MainVerticle::class.java)
 
@@ -30,21 +41,33 @@ class MainVerticle(private val jobGateway: JobGateway, private val workerGateway
     private lateinit var workerUseCases: WorkerUseCaseLookUp
     private lateinit var jobController: JobController
     private lateinit var workerController: WorkerController
+    private var httpMetrics: HttpMetrics? = null
 
     var actualPort: Int = -1
         private set
 
+    /**
+     * Runs a single dead-worker cleanup pass and returns the number of workers affected. The single
+     * entry point for a cleanup pass: the periodic timer ([start]) invokes it, and it is also
+     * public so tests and operators can drive it deterministically instead of waiting for the
+     * timer.
+     */
+    suspend fun runDeadWorkerCleanup(): Int = workerUseCases.cleanupDeadWorkersUseCase.execute()
+
     override suspend fun start() {
-        val condemnPeriodMs = config.getLong("cleanup.condemn.period.ms", 15000L)
-        jobUseCases = JobUseCaseLookUp(jobGateway, workerGateway)
-        workerUseCases = WorkerUseCaseLookUp(workerGateway, jobGateway, condemnPeriodMs)
+        val metrics = buildMetrics()
+        jobUseCases = JobUseCaseLookUp(jobGateway, workerGateway, unitOfWork, metrics)
+        workerUseCases = WorkerUseCaseLookUp(workerGateway, jobGateway, unitOfWork)
         jobController = JobController(jobUseCases)
         workerController = WorkerController(workerUseCases)
 
         DatabindCodec.mapper().registerModule(KotlinModule.Builder().build())
 
         val router = Router.router(vertx)
-        router.route().handler(BodyHandler.create())
+        httpMetrics?.let { hm -> router.route().handler(hm::handle) }
+        val bodyHandler = BodyHandler.create()
+        if (appConfig.maxBodyBytes >= 0) bodyHandler.setBodyLimit(appConfig.maxBodyBytes)
+        router.route().handler(bodyHandler)
 
         val v1 = Router.router(vertx)
         coroutineRouter {
@@ -54,21 +77,39 @@ class MainVerticle(private val jobGateway: JobGateway, private val workerGateway
         v1.route().failureHandler(::handleFailure)
         router.route("/api/v1/*").subRouter(v1)
 
-        val port = config.getInteger("http.port", 8080)
-        val server = vertx.createHttpServer().requestHandler(router).listen(port).coAwait()
+        val server =
+            vertx
+                .createHttpServer()
+                .requestHandler(router)
+                .listen(appConfig.httpPort, appConfig.httpHost)
+                .coAwait()
         actualPort = server.actualPort()
-        logger.info("HTTP server started on port {}", actualPort)
+        logger.info("HTTP server started on {}:{}", appConfig.httpHost, actualPort)
 
-        val cleanupIntervalMs = config.getLong("cleanup.interval.ms", 30000L)
-        vertx.setPeriodic(cleanupIntervalMs) {
+        vertx.setPeriodic(appConfig.cleanupIntervalMs) {
             launch {
                 try {
-                    workerUseCases.cleanupDeadWorkersUseCase.execute()
+                    runDeadWorkerCleanup()
                 } catch (e: Exception) {
                     logger.error("Dead worker cleanup failed", e)
                 }
             }
         }
+    }
+
+    /**
+     * Builds the domain [Metrics] implementation from config. Off by default; when
+     * `metrics.enabled=true`, installs the OpenTelemetry SDK (autoconfigured via standard `OTEL_*`
+     * settings) and also wires the per-request HTTP metrics handler.
+     */
+    private fun buildMetrics(): Metrics {
+        if (!appConfig.metrics.enabled) return NoopMetrics
+        val serviceName = appConfig.metrics.serviceName
+        Telemetry.install(serviceName, appConfig.metrics.otlpEndpoint)
+        val meter = Telemetry.meter()
+        httpMetrics = HttpMetrics(meter)
+        logger.info("OpenTelemetry metrics enabled (service={})", serviceName)
+        return OtelMetrics(meter)
     }
 
     private fun handleFailure(rc: RoutingContext) {
@@ -100,9 +141,6 @@ class MainVerticle(private val jobGateway: JobGateway, private val workerGateway
                 is JobNotFoundException,
                 is CheckpointNotFoundException,
                 is WorkerNotFoundException -> 404 to failure.message
-
-                // 403 — Forbidden
-                is WorkerCondemnedException -> 403 to failure.message
 
                 // 409 — Conflict
                 is DuplicateIdempotencyKeyException,

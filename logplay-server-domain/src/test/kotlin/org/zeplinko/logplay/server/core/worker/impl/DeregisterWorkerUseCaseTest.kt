@@ -6,6 +6,7 @@ import kotlinx.coroutines.test.runTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.zeplinko.logplay.server.core.fakes.InMemoryUnitOfWork
 import org.zeplinko.logplay.server.core.job.*
 import org.zeplinko.logplay.server.core.job.fakes.InMemoryJobGateway
 import org.zeplinko.logplay.server.core.worker.*
@@ -21,7 +22,7 @@ class DeregisterWorkerUseCaseTest {
     fun setUp() {
         workerGateway = InMemoryWorkerGateway()
         jobGateway = InMemoryJobGateway()
-        useCase = DeregisterWorkerUseCaseImpl(workerGateway, jobGateway)
+        useCase = DeregisterWorkerUseCaseImpl(workerGateway, jobGateway, InMemoryUnitOfWork())
     }
 
     // --- Happy path ---
@@ -84,21 +85,18 @@ class DeregisterWorkerUseCaseTest {
     }
 
     @Test
-    fun `execute should condemn worker before releasing jobs to prevent new acquisitions`() =
-        runTest {
-            val worker = aWorker("worker-1")
-            workerGateway.save(worker)
-            val job = aJob(acquiredByWorkerId = "worker-1")
-            jobGateway.save(job)
+    fun `execute should delete the worker and release its jobs atomically`() = runTest {
+        val worker = aWorker("worker-1")
+        workerGateway.save(worker)
+        val job = aJob(acquiredByWorkerId = "worker-1")
+        jobGateway.save(job)
 
-            useCase.execute(DeregisterWorkerCommand("worker-1"))
+        useCase.execute(DeregisterWorkerCommand("worker-1"))
 
-            // Worker should be fully deleted
-            assertThat(workerGateway.findWorkerById("worker-1")).isNull()
-            // Job should be released
-            assertThat(jobGateway.findJobById(job.id)!!.status).isEqualTo(JobStatus.PENDING)
-            // A condemned worker cannot acquire new jobs (tested via the INNER JOIN guard)
-        }
+        // Worker is deleted and its job released in a single transaction.
+        assertThat(workerGateway.findWorkerById("worker-1")).isNull()
+        assertThat(jobGateway.findJobById(job.id)!!.status).isEqualTo(JobStatus.PENDING)
+    }
 
     // --- Validation ---
 

@@ -23,8 +23,9 @@ interface CreateJobUseCase {
  */
 interface AcquirePendingJobsUseCase {
     /**
-     * @return the acquired jobs in `enqueued_at ASC` order. Empty list (not an error) if no
-     *   matching pending jobs exist or the worker is unknown/condemned.
+     * @return the acquired jobs in `enqueued_at ASC` order. Empty list (not an error) if the worker
+     *   is live but no matching pending jobs exist.
+     * @throws WorkerNotFoundException if the worker is unknown or has timed out (must re-register).
      * @throws BlankGroupIdException, BlankJobTypeException, BlankWorkerIdException,
      *   InvalidLimitException for input validation failures.
      */

@@ -1,10 +1,17 @@
 package org.zeplinko.logplay.server.core.job.impl
 
 import java.time.Instant
+import org.zeplinko.logplay.server.core.Metrics
+import org.zeplinko.logplay.server.core.NoopMetrics
+import org.zeplinko.logplay.server.core.UnitOfWork
 import org.zeplinko.logplay.server.core.job.*
 import org.zeplinko.logplay.server.core.worker.BlankWorkerIdException
 
-class SaveJobCheckpointUseCaseImpl(private val jobGateway: JobGateway) : SaveJobCheckpointUseCase {
+class SaveJobCheckpointUseCaseImpl(
+    private val jobGateway: JobGateway,
+    private val unitOfWork: UnitOfWork,
+    private val metrics: Metrics = NoopMetrics,
+) : SaveJobCheckpointUseCase {
 
     companion object {
         const val MAX_NAME_LENGTH = 256
@@ -13,32 +20,43 @@ class SaveJobCheckpointUseCaseImpl(private val jobGateway: JobGateway) : SaveJob
     override suspend fun execute(command: SaveJobCheckpointCommand): Checkpoint {
         validate(command)
         val now = Instant.now()
-        val result =
-            jobGateway.saveCheckpoint(command.jobId, command.workerId, now) { lastCheckpoint ->
-                if (lastCheckpoint?.id != command.previousCheckpointId)
+        val saved =
+            unitOfWork.transaction {
+                val job =
+                    jobGateway.findAndLockJobById(command.jobId)
+                        ?: throw JobNotFoundException(command.jobId)
+                when (job.status) {
+                    JobStatus.ACQUIRED -> Unit
+                    JobStatus.PENDING,
+                    JobStatus.FINISHED,
+                    JobStatus.FAILED,
+                    JobStatus.ABORTED -> throw JobNotAcquiredException(command.jobId, job.status)
+                }
+                if (job.acquiredByWorkerId != command.workerId)
+                    throw JobNotOwnedByWorkerException(command.jobId, command.workerId)
+                val tail = jobGateway.latestCheckpoint(command.jobId)
+                if (tail?.id != command.previousCheckpointId)
                     throw InvalidCheckpointOrderException(command.jobId)
-                Checkpoint(
-                    id =
-                        CheckpointIdGenerator.fromChainPosition(
-                            command.jobId,
-                            command.previousCheckpointId,
-                        ),
-                    jobId = command.jobId,
-                    previousCheckpointId = command.previousCheckpointId,
-                    name = command.name,
-                    createdAt = now,
-                    orderKey = (lastCheckpoint?.orderKey ?: 0) + 1,
-                    data = command.data,
-                )
+                val checkpoint =
+                    Checkpoint(
+                        id =
+                            CheckpointIdGenerator.fromChainPosition(
+                                command.jobId,
+                                command.previousCheckpointId,
+                            ),
+                        jobId = command.jobId,
+                        previousCheckpointId = command.previousCheckpointId,
+                        name = command.name,
+                        createdAt = now,
+                        orderKey = (tail?.orderKey ?: 0) + 1,
+                        data = command.data,
+                    )
+                jobGateway.insertCheckpoint(checkpoint)
+                jobGateway.resetAcquiredRetries(command.jobId)
+                checkpoint
             }
-        return when (result) {
-            is SaveCheckpointResult.Success -> result.checkpoint
-            is SaveCheckpointResult.NotFound -> throw JobNotFoundException(command.jobId)
-            is SaveCheckpointResult.WrongStatus ->
-                throw JobNotAcquiredException(command.jobId, result.status)
-            is SaveCheckpointResult.WrongWorker ->
-                throw JobNotOwnedByWorkerException(command.jobId, command.workerId)
-        }
+        metrics.onCheckpointSaved(command.data?.size ?: 0)
+        return saved
     }
 
     private fun validate(command: SaveJobCheckpointCommand) {

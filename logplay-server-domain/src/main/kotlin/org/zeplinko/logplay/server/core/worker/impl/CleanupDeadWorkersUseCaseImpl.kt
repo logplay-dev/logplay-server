@@ -1,10 +1,8 @@
 package org.zeplinko.logplay.server.core.worker.impl
 
 import java.time.Instant
-import java.util.UUID
-import org.zeplinko.logplay.server.core.job.ActorType
+import org.zeplinko.logplay.server.core.UnitOfWork
 import org.zeplinko.logplay.server.core.job.JobEvent
-import org.zeplinko.logplay.server.core.job.JobEventType
 import org.zeplinko.logplay.server.core.job.JobGateway
 import org.zeplinko.logplay.server.core.worker.CleanupDeadWorkersUseCase
 import org.zeplinko.logplay.server.core.worker.WorkerGateway
@@ -12,34 +10,29 @@ import org.zeplinko.logplay.server.core.worker.WorkerGateway
 class CleanupDeadWorkersUseCaseImpl(
     private val workerGateway: WorkerGateway,
     private val jobGateway: JobGateway,
-    private val condemnPeriodMs: Long = 15000L,
+    private val unitOfWork: UnitOfWork,
 ) : CleanupDeadWorkersUseCase {
 
+    /**
+     * Single atomic pass: lock the dead workers (`now - lastHeartbeatAt > sessionTimeout`), release
+     * their jobs back to the queue, and delete the worker rows. Locking the worker rows first
+     * serialises this against `acquire`/deregister on the same worker; the reaper drains every job
+     * before the delete so the worker FK is never violated.
+     */
     override suspend fun execute(): Int {
         val now = Instant.now()
-
-        // Phase 2: Evict condemned workers whose condemn period has elapsed
-        val condemnedWorkers = workerGateway.findCondemnedWorkers(now, condemnPeriodMs)
-        if (condemnedWorkers.isNotEmpty()) {
-            val condemnedIds = condemnedWorkers.map { it.id }
-            jobGateway.releaseJobsByWorkerIds(condemnedIds, now) { jobId ->
-                JobEvent(
-                    id = UUID.randomUUID().toString(),
-                    jobId = jobId,
-                    eventType = JobEventType.RELEASED,
-                    actorType = ActorType.SYSTEM,
-                    actorId = null,
-                    createdAt = now,
-                    eventMessage = "released by dead-worker cleanup after condemn period elapsed",
-                    eventDetail = null,
-                )
-            }
-            workerGateway.deleteWorkers(condemnedIds)
+        return unitOfWork.transaction {
+            val dead = workerGateway.findAndLockDeadWorkers(now)
+            if (dead.isEmpty()) return@transaction 0
+            val deadIds = dead.map { it.id }
+            val releasedIds = jobGateway.releaseJobsByWorkerIds(deadIds, now)
+            jobGateway.insertEvents(
+                releasedIds.map { jobId ->
+                    JobEvent.released(jobId, now, "released by dead-worker cleanup")
+                }
+            )
+            workerGateway.deleteWorkers(deadIds)
+            dead.size
         }
-
-        // Phase 1: Atomically condemn newly dead workers
-        val condemnedCount = workerGateway.condemnDeadWorkers(now)
-
-        return condemnedWorkers.size + condemnedCount
     }
 }

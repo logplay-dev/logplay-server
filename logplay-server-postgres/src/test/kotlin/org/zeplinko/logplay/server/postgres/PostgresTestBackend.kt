@@ -9,9 +9,11 @@ import java.sql.Connection
 import java.sql.DriverManager
 import org.flywaydb.core.Flyway
 import org.testcontainers.containers.PostgreSQLContainer
+import org.zeplinko.logplay.server.core.UnitOfWork
 import org.zeplinko.logplay.server.core.job.JobGateway
 import org.zeplinko.logplay.server.core.worker.WorkerGateway
 import org.zeplinko.logplay.server.job.adapters.PostgresJobGateway
+import org.zeplinko.logplay.server.job.adapters.PostgresUnitOfWork
 import org.zeplinko.logplay.server.job.adapters.PostgresWorkerGateway
 import org.zeplinko.logplay.server.test.IntegrationTestBackend
 
@@ -43,6 +45,8 @@ class PostgresTestBackend(private val postgres: PostgreSQLContainer<*>) : Integr
                 .build()
         return PostgresJobGateway(pool) to PostgresWorkerGateway(pool)
     }
+
+    override fun createUnitOfWork(): UnitOfWork = PostgresUnitOfWork(pool)
 
     override fun getJdbcConnection(): Connection =
         DriverManager.getConnection(postgres.jdbcUrl, postgres.username, postgres.password)
